@@ -1,4 +1,4 @@
-import { mysqlTable, int, varchar, text, timestamp, decimal, mysqlEnum, index, uniqueIndex } from "drizzle-orm/mysql-core";
+import { mysqlTable, int, varchar, text, timestamp, decimal, mysqlEnum } from "drizzle-orm/mysql-core";
 
 export const users = mysqlTable("users", {
   id: int("id").primaryKey().autoincrement(),
@@ -11,9 +11,7 @@ export const users = mysqlTable("users", {
   isActive: int("is_active").default(1).notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
-}, (table) => [
-  uniqueIndex("email_idx").on(table.email),
-]);
+});
 
 export const styleDiagnoses = mysqlTable("style_diagnoses", {
   id: int("id").primaryKey().autoincrement(),
@@ -27,9 +25,7 @@ export const styleDiagnoses = mysqlTable("style_diagnoses", {
   confidenceScore: decimal("confidence_score", { precision: 3, scale: 2 }),
   userFeedback: int("user_feedback"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
-}, (table) => [
-  index("user_id_idx").on(table.userId),
-]);
+});
 
 export const subscriptions = mysqlTable("subscriptions", {
   id: int("id").primaryKey().autoincrement(),
@@ -43,9 +39,7 @@ export const subscriptions = mysqlTable("subscriptions", {
   amount: decimal("amount", { precision: 10, scale: 2 }),
   autoRenew: int("auto_renew").default(1),
   createdAt: timestamp("created_at").defaultNow().notNull(),
-}, (table) => [
-  index("user_sub_idx").on(table.userId),
-]);
+});
 
 export const styleSystems = mysqlTable("style_systems", {
   id: int("id").primaryKey().autoincrement(),
@@ -65,9 +59,7 @@ export const styleSystems = mysqlTable("style_systems", {
   sortOrder: int("sort_order").default(0),
   isActive: int("is_active").default(1).notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
-}, (table) => [
-  uniqueIndex("code_idx").on(table.code),
-]);
+});
 
 export const refreshTokens = mysqlTable("refresh_tokens", {
   id: int("id").primaryKey().autoincrement(),

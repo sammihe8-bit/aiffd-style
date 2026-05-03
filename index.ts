@@ -56,4 +56,3 @@ app.listen(PORT, () => {
   console.log(`🔧 tRPC 端点: http://localhost:${PORT}/api/trpc`);
 });
 
-export default app;

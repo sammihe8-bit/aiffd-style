@@ -55,12 +55,13 @@ export const appRouter = router({
       vipLevel: "none",
     });
  login: publicProcedure
+  login: publicProcedure
   .input(z.object({
     email: z.string().email().optional(),
     phone: z.string().optional(),
     password: z.string().min(1),
   }))
-  .mutation(async ({ input }) => {
+  .mutation(async ({ input }) => {        // ← 添加这一行！
     const { email, password, phone } = input;
 
     // 优先用邮箱查找，如果没有邮箱则用手机号
@@ -83,6 +84,32 @@ export const appRouter = router({
 
     if (userList.length === 0) {
       throw new Error("邮箱或密码错误");
+    }
+
+    const user = userList[0];
+    const isValid = await bcrypt.compare(password, user.passwordHash);
+    if (!isValid) {
+      throw new Error("邮箱或密码错误");
+    }
+
+    if (!user.isActive) {
+      throw new Error("账号已被禁用");
+    }
+
+    const token = generateToken(user.id, user.email || user.phone, user.role, user.membershipTier || "free");
+    return {
+      message: "登录成功",
+      token,
+      user: { 
+        id: user.id, 
+        phone: user.phone,
+        email: user.email, 
+        name: user.name, 
+        role: user.role, 
+        membershipTier: user.membershipTier || "free" 
+      }
+    };
+  }),                                    // ← 确保有闭合
     }
 
     const user = userList[0];

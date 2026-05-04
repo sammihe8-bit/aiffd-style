@@ -24,22 +24,27 @@ export const appRouter = router({
 
   user: router({
 register: publicProcedure
-  .input(z.object({
-    email: z.string().email("请输入有效邮箱"),  // ← 改回必填
-    password: z.string().min(6, "密码至少6位"),
-    name: z.string().optional(),
+.input(z.object({
+  email: z.string().email("请输入有效邮箱").optional(),  // ← 加 .optional()
+  password: z.string().min(6, "密码至少6位"),
+  name: z.string().optional(),
+  phone: z.string().optional(),
+}))
     phone: z.string().optional(),              // ← 手机号可选
   }))
   .mutation(async ({ input }) => {
-    const { email, password, name, phone } = input;
+// 如果提供了邮箱，检查是否已存在
+if (email) {
+  const existing = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, email))
+    .limit(1);
 
-    // 检查邮箱是否已存在
-    const existing = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, email))
-      .limit(1);
-    
+  if (existing.length > 0) {
+    throw new Error("该邮箱已被注册");
+  }
+}
     if (existing.length > 0) {
       throw new Error("该邮箱已被注册");
     }

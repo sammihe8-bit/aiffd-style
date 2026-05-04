@@ -54,7 +54,12 @@ export const appRouter = router({
       isVip: false,
       vipLevel: "none",
     });
-
+ login: publicProcedure
+  .input(z.object({
+    email: z.string().email().optional(),
+    phone: z.string().optional(),  // ← 添加手机号登录
+    password: z.string().min(1),
+  }))
     const userId = Number(result[0].insertId);
     const token = generateToken(userId, email || phone, "user", "free");
 

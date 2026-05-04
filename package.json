@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "scripts": {
     "dev": "tsx watch index.ts",
-    "build": "tsc",
+    "build": "tsc" ,
     "start": "node dist/index.js",
     "db:push": "drizzle-kit push",
     "db:seed": "tsx db/seed-style-system.ts"

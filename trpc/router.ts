@@ -23,36 +23,52 @@ export const appRouter = router({
   }),
 
   user: router({
-    register: publicProcedure
+register: publicProcedure
   .input(z.object({
-    email: z.string().email().optional().or(z.literal("")),  // ← 改为可选，允许空字符串
-    password: z.string().min(6),
+    email: z.string().email("请输入有效邮箱"),  // ← 改回必填
+    password: z.string().min(6, "密码至少6位"),
     name: z.string().optional(),
-    phone: z.string().min(1, "请输入手机号"),  // ← 改为必填
+    phone: z.string().optional(),              // ← 手机号可选
   }))
   .mutation(async ({ input }) => {
     const { email, password, name, phone } = input;
 
-    // 检查手机号是否已存在
+    // 检查邮箱是否已存在
     const existing = await db
       .select()
       .from(users)
-      .where(eq(users.phone, phone))
+      .where(eq(users.email, email))
       .limit(1);
     
     if (existing.length > 0) {
-      throw new Error("该手机号已被注册");
+      throw new Error("该邮箱已被注册");
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
     const result = await db.insert(users).values({
-      phone,
-      email: email || null,  // ← 空字符串转为 null
+      email,
       passwordHash,
       name: name || null,
-      role: "consumer",
-      isVip: false,
-      vipLevel: "none",
+      role: "user",
+      membershipTier: "free",
+      isActive: 1,
+    });
+
+    const userId = Number(result[0].insertId);
+    const token = generateToken(userId, email, "user", "free");
+
+    return {
+      message: "注册成功",
+      token,
+      user: { 
+        id: userId, 
+        email, 
+        name: name || null, 
+        role: "user", 
+        membershipTier: "free" 
+      }
+    };
+  }),
     });
 login: publicProcedure
   .input(z.object({

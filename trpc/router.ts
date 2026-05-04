@@ -54,45 +54,20 @@ register: publicProcedure
       isActive: 1,
     });
 
-    const userId = Number(result[0].insertId);
-    const token = generateToken(userId, email, "user", "free");
-
-    return {
-      message: "注册成功",
-      token,
-      user: { 
-        id: userId, 
-        email, 
-        name: name || null, 
-        role: "user", 
-        membershipTier: "free" 
-      }
-    };
-  }),
-    });
 login: publicProcedure
   .input(z.object({
     email: z.string().email().optional(),
     phone: z.string().optional(),
     password: z.string().min(1),
   }))
-  .mutation(async ({ input }) => {        // ← 添加这一行！
+  .mutation(async ({ input }) => {
     const { email, password, phone } = input;
 
-    // 优先用邮箱查找，如果没有邮箱则用手机号
     let userList;
     if (email) {
-      userList = await db
-        .select()
-        .from(users)
-        .where(eq(users.email, email))
-        .limit(1);
+      userList = await db.select().from(users).where(eq(users.email, email)).limit(1);
     } else if (phone) {
-      userList = await db
-        .select()
-        .from(users)
-        .where(eq(users.phone, phone))
-        .limit(1);
+      userList = await db.select().from(users).where(eq(users.phone, phone)).limit(1);
     } else {
       throw new Error("请输入邮箱或手机号");
     }
@@ -111,60 +86,7 @@ login: publicProcedure
       throw new Error("账号已被禁用");
     }
 
-    const token = generateToken(user.id, user.email || user.phone, user.role, user.membershipTier || "free");
-    return {
-      message: "登录成功",
-      token,
-      user: { 
-        id: user.id, 
-        phone: user.phone,
-        email: user.email, 
-        name: user.name, 
-        role: user.role, 
-        membershipTier: user.membershipTier || "free" 
-      }
-    };
-  }),                                    // ← 确保有闭合
-      throw new Error("邮箱或密码错误");
-    }
-
-    const user = userList[0];
-    const isValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isValid) {
-      throw new Error("邮箱或密码错误");
-    }
-
-    if (!user.isActive) {
-      throw new Error("账号已被禁用");
-    }
-
-    const token = generateToken(user.id, user.email || user.phone, user.role, user.membershipTier || "free");
-    return {
-      message: "登录成功",
-      token,
-      user: { 
-        id: user.id, 
-        phone: user.phone,
-        email: user.email, 
-        name: user.name, 
-        role: user.role, 
-        membershipTier: user.membershipTier || "free" 
-      }
-    };
-  }),                                    // ← 确保有闭合
-    }
-
-    const user = userList[0];
-    const isValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isValid) {
-      throw new Error("邮箱或密码错误");
-    }
-
-    if (!user.isActive) {
-      throw new Error("账号已被禁用");
-    }
-
-    const token = generateToken(user.id, user.email || user.phone, user.role, user.membershipTier || "free");
+    const token = generateToken(user.id, user.email, user.role, user.membershipTier);
     return {
       message: "登录成功",
       token,
@@ -178,33 +100,6 @@ login: publicProcedure
       }
     };
   }),
-        const { email, password } = input;
-        const userList = await db.select().from(users).where(eq(users.email, email)).limit(1);
-        
-        if (userList.length === 0) {
-          throw new Error("邮箱或密码错误");
-        }
-
-        const user = userList[0];
-        const isValid = await bcrypt.compare(password, user.passwordHash);
-        if (!isValid) {
-          throw new Error("邮箱或密码错误");
-        }
-        if (!user.isActive) {
-          throw new Error("账号已被禁用");
-        }
-
-        const token = generateToken(user.id, user.email, user.role, user.membershipTier);
-        return {
-          message: "登录成功",
-          token,
-          user: { id: user.id, email: user.email, name: user.name, role: user.role, membershipTier: user.membershipTier }
-        };
-      }),
-
-    profile: publicProcedure.query(async () => {
-      return { message: "需要认证" };
-    }),
   }),
 
   diagnosis: router({

@@ -1,4 +1,3 @@
-import { initTRPC } from "@trpc/server";
 import superjson from "superjson";
 import { z } from "zod";
 import { db } from "../db";
@@ -7,9 +6,7 @@ import { eq, desc } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
-const t = initTRPC.create({
-  transformer: superjson,
-});
+const t = initTRPC.create();
 
 export const router = t.router;
 export const publicProcedure = t.procedure;

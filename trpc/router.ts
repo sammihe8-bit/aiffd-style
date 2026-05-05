@@ -31,9 +31,6 @@ register: publicProcedure
   password: z.string().min(6, "密码至少6位"),
   name: z.string().optional(),
   phone: z.string().optional(),
-}))
-    phone: z.string().optional(),              // ← 手机号可选
-  }))
   .mutation(async ({ input }) => {
 // 如果提供了邮箱，检查是否已存在
 if (email) {

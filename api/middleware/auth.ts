@@ -7,7 +7,7 @@ export interface AuthRequest extends Request {
 
 const JWT_SECRET = process.env.JWT_SECRET || "aiffd-secret-key";
 
-export function generateToken(userId: number, email: string, role: string, membershipTier: string): string {
+export function generateToken(userId: number, email: string | null, role: string, membershipTier: string) {
   return jwt.sign({ id: userId, email, role, membershipTier }, JWT_SECRET, { expiresIn: "7d" });
 }
 

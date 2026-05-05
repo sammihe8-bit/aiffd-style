@@ -32,8 +32,6 @@ register: publicProcedure
   name: z.string().optional(),
   phone: z.string().optional(),
 }))
-    phone: z.string().optional(),              // ← 手机号可选
-  }))
   .mutation(async ({ input }) => {
 // 如果提供了邮箱，检查是否已存在
 if (email) {

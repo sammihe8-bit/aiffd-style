@@ -58,7 +58,7 @@ if (email) {
       membershipTier: "free",
       isActive: 1,
     });
-
+}), 
 login: publicProcedure
   .input(z.object({
     email: z.string().email().optional(),

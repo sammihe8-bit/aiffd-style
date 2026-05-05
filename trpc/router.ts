@@ -1,4 +1,5 @@
 import { initTRPC } from "@trpc/server";
+import superjson from "superjson";
 import { z } from "zod";
 import { db } from "../db";
 import { users, styleDiagnoses, styleSystems, subscriptions } from "../db/schema";
@@ -7,6 +8,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
 const t = initTRPC.create({
+  transformer: superjson,
 });
 
 export const router = t.router;

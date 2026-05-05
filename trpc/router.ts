@@ -50,15 +50,20 @@ export const appRouter = router({
         }
 
         const passwordHash = await bcrypt.hash(password, 12);
-        const result = await db.insert(users).values({
-          email: email || null,
+        
+        // 构建插入数据，只包含有效字段
+        const insertData: any = {
           passwordHash,
-          name: name || null,
-          phone: phone || null,
           role: "user",
           membershipTier: "free",
           isActive: 1,
-        });
+        };
+        
+        if (email) insertData.email = email;
+        if (name) insertData.name = name;
+        if (phone) insertData.phone = phone;
+
+        const result = await db.insert(users).values(insertData);
 
         const insertedId = Number(result[0].insertId);
         const token = generateToken(insertedId, email || null, "user", "free");
@@ -157,4 +162,4 @@ export const appRouter = router({
 });
 
 export type AppRouter = typeof appRouter;
-// 强制重新部署 - 2026-05-05
+// 强制重新部署 - 2026-05-05-fix2

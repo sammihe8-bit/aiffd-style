@@ -1,4 +1,4 @@
-import superjson from "superjson";
+import { initTRPC } from "@trpc/server";
 import { z } from "zod";
 import { db } from "../db";
 import { users, styleDiagnoses, styleSystems, subscriptions } from "../db/schema";

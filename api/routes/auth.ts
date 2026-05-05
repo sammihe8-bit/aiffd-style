@@ -26,7 +26,9 @@ router.post("/register", async (req, res) => {
     if (existing.length > 0) return res.status(409).json({ error: "该邮箱已被注册" });
     
     const passwordHash = await bcrypt.hash(password, 12);
-    const result = await db.insert(users).values({ email, passwordHash, name: name || null });
+const insertData: any = { email, passwordHash };
+if (name) insertData.name = name;
+const result = await db.insert(users).values(insertData);
     const userId = Number(result[0].insertId);
     const token = generateToken(userId, email, "user", "free");
     

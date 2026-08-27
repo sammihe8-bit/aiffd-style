@@ -70,8 +70,22 @@ export const refreshTokens = mysqlTable("refresh_tokens", {
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
+// 2026-08-27 新增：测试进度存档，支撑"续测提醒"功能
+// 每个用户 + 每种测试类型（body/style/color/fashion）只保留最新一条记录（upsert，见 test-progress 路由）
+export const testProgress = mysqlTable("test_progress", {
+  id: int("id").primaryKey().autoincrement(),
+  userId: int("user_id").notNull(),
+  testType: mysqlEnum("test_type", ["body", "style", "color", "fashion"]).notNull(),
+  status: mysqlEnum("status", ["in_progress", "completed"]).notNull(),
+  dataJson: text("data_json").notNull(), // 完整快照：当前所在题目位置 + 所有已答的答案，JSON.stringify 存
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 export type StyleDiagnosis = typeof styleDiagnoses.$inferSelect;
 export type Subscription = typeof subscriptions.$inferSelect;
 export type StyleSystem = typeof styleSystems.$inferSelect;
+export type TestProgress = typeof testProgress.$inferSelect;
+export type NewTestProgress = typeof testProgress.$inferInsert;

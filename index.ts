@@ -8,6 +8,7 @@ import userRoutes from "./api/routes/user";
 import diagnosisRoutes from "./api/routes/diagnosis";
 import subscriptionRoutes from "./api/routes/subscription";
 import testProgressRoutes from "./api/routes/test-progress";
+import humanProfileRoutes from "./api/routes/human-profile";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,6 +28,7 @@ app.use("/api/user", userRoutes);
 app.use("/api/diagnosis", diagnosisRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/test-progress", testProgressRoutes);
+app.use("/api/human-profile", humanProfileRoutes);
 
 app.use((req, res) => res.status(404).json({ error: "接口不存在" }));
 

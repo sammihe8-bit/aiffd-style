@@ -172,7 +172,11 @@ export const humanStyleProfiles = mysqlTable("human_style_profiles", {
     "very_dark_brown", "dark_brown", "medium_brown", "light_brown_amber",
     "hazel", "green", "gray", "blue", "other", "uncertain",
   ]),
-  warmCool: mysqlEnum("warm_cool", ["warm", "cool", "neutral_warm", "neutral_cool", "olive"]),
+  // 2026-09-21 产品确认：加上 uncertain，用于表达"完全判断不出偏暖偏冷"的低置信度
+  // 情况，跟 neutral_warm/neutral_cool（真实判断为中性偏暖/偏冷）是两回事。
+  // 同步这个改动的还有 Fashion Item DB 的 fashion_variant_color_attributes.color_temperature，
+  // 两边必须保持同一套值，因为 Matching Engine 要直接比较这两个字段。
+  warmCool: mysqlEnum("warm_cool", ["warm", "cool", "neutral_warm", "neutral_cool", "olive", "uncertain"]),
   valueLevel: mysqlEnum("value_level", ["高", "中", "低"]),
   saturationLevel: mysqlEnum("saturation_level", ["高", "中", "低"]),
   seasonName: mysqlEnum("season_name", ["春", "夏", "长夏", "秋", "冬"]),

@@ -315,3 +315,259 @@ export type ProfileLifestyleScenario = typeof profileLifestyleScenarios.$inferSe
 export type ProfileItemPreference = typeof profileItemPreferences.$inferSelect;
 export type ProfileVisualStylePreference = typeof profileVisualStylePreferences.$inferSelect;
 export type ProfileColorSignal = typeof profileColorSignals.$inferSelect;
+
+// ══════════════════════════════════════════════════════════════════
+// Fashion Item Database —— 对齐 Fashion Item Attribute Dictionary V1.0
+// Part A（Category Taxonomy + Structure Attributes）
+// Part B（Style Attributes）
+// Part C（Material + Color Attributes）
+// 2026-09-21 新增，9 张表
+// ══════════════════════════════════════════════════════════════════
+
+const FIELD_SOURCE_METHODS = [
+  "brand_source", "manual_operator", "stylist",
+  "ai_image_analysis", "ai_text_analysis", "system_inference",
+] as const;
+
+const STYLE_CODES = [
+  "R", "TR", "SG", "G", "FG", "SC", "C", "DC", "SN", "N", "FN", "SD", "D",
+] as const;
+
+const STYLE_SOURCE_METHODS = ["rule_engine", "ai_image_analysis", "ai_text_analysis", "stylist"] as const;
+
+export const fashionItems = mysqlTable("fashion_items", {
+  id: int("id").primaryKey().autoincrement(),
+  itemId: varchar("item_id", { length: 30 }).notNull().unique(),
+
+  brandName: varchar("brand_name", { length: 100 }),
+  itemName: varchar("item_name", { length: 255 }),
+  sourceCategory: varchar("source_category", { length: 100 }),
+  category: mysqlEnum("category", [
+    "tops", "outerwear", "dresses", "bottoms", "one_piece", "shoes", "bags", "accessories",
+  ]).notNull(),
+  subcategory: varchar("subcategory", { length: 50 }),
+  productUrl: varchar("product_url", { length: 500 }),
+  sourceSite: varchar("source_site", { length: 100 }),
+  status: mysqlEnum("status", ["active", "inactive", "archived"]).default("active").notNull(),
+
+  silhouette: mysqlEnum("silhouette", [
+    "straight", "H", "X", "A", "V", "O", "fitted", "fluid", "uncertain",
+  ]),
+  shoulderStructure: mysqlEnum("shoulder_structure", [
+    "narrow", "balanced", "broad", "dropped", "extended", "padded", "rounded", "structured", "uncertain",
+  ]),
+  waistStructure: mysqlEnum("waist_structure", [
+    "undefined", "straight", "slight_definition", "defined", "cinched", "empire", "low_waist", "uncertain",
+  ]),
+  fit: mysqlEnum("fit", ["body_con", "slim", "regular", "relaxed", "oversized"]),
+  garmentLength: mysqlEnum("garment_length", [
+    "cropped", "short", "regular", "hip", "mid_thigh", "knee", "midi", "long", "maxi",
+  ]),
+  neckline: mysqlEnum("neckline", [
+    "crew", "round", "v_neck", "deep_v", "square", "boat", "halter", "off_shoulder", "one_shoulder",
+    "shirt_collar", "stand_collar", "turtleneck", "mock_neck", "lapel", "hood", "other",
+  ]),
+  baseSleeveLength: mysqlEnum("base_sleeve_length", [
+    "sleeveless", "cap_sleeve", "short", "elbow", "three_quarter", "long", "uncertain",
+  ]),
+  sleeveShape: mysqlEnum("sleeve_shape", [
+    "straight", "puff", "bishop", "bell", "batwing", "raglan", "drop_shoulder", "uncertain",
+  ]),
+  structureLevel: mysqlEnum("structure_level", [
+    "soft", "soft_medium", "medium", "medium_structured", "structured",
+  ]),
+  lineQuality: mysqlEnum("line_quality", [
+    "curved", "soft_curved", "balanced", "soft_straight", "straight", "angular",
+  ]),
+  visualVolume: mysqlEnum("visual_volume", ["very_small", "small", "medium", "large", "very_large"]),
+  decorationLevel: mysqlEnum("decoration_level", ["minimal", "low", "medium", "high", "ornate"]),
+  visualFocus: mysqlEnum("visual_focus", ["upper", "center", "waist", "lower", "overall", "asymmetric", "none"]),
+
+  primaryStyle: mysqlEnum("primary_style", STYLE_CODES),
+  secondaryStyle: mysqlEnum("secondary_style", STYLE_CODES),
+  styleConfidence: decimal("style_confidence", { precision: 3, scale: 2 }),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+export const fashionItemVariants = mysqlTable("fashion_item_variants", {
+  id: int("id").primaryKey().autoincrement(),
+  variantId: varchar("variant_id", { length: 30 }).notNull().unique(),
+  itemId: varchar("item_id", { length: 30 }).notNull(),
+
+  sku: varchar("sku", { length: 100 }),
+  colorNameSource: varchar("color_name_source", { length: 100 }),
+  sizeOptions: text("size_options"),
+  price: decimal("price", { precision: 10, scale: 2 }),
+  currency: varchar("currency", { length: 3 }).default("CNY").notNull(),
+  availability: boolean("availability").default(true).notNull(),
+  productUrl: varchar("product_url", { length: 500 }),
+
+  inheritsItemStyle: boolean("inherits_item_style").default(true).notNull(),
+  overrideReason: varchar("override_reason", { length: 255 }),
+  variantStyleVersion: varchar("variant_style_version", { length: 20 }),
+  variantMaterialOverride: boolean("variant_material_override").default(false).notNull(),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+export const fashionItemFieldSources = mysqlTable("fashion_item_field_sources", {
+  id: int("id").primaryKey().autoincrement(),
+  itemId: varchar("item_id", { length: 30 }).notNull(),
+  variantId: varchar("variant_id", { length: 30 }),
+
+  fieldName: varchar("field_name", { length: 50 }).notNull(),
+  value: varchar("value", { length: 100 }).notNull(),
+
+  sourceMethod: mysqlEnum("source_method", FIELD_SOURCE_METHODS).notNull(),
+  confidence: decimal("confidence", { precision: 3, scale: 2 }),
+  verifiedStatus: mysqlEnum("verified_status", [
+    "unverified", "pending_review", "needs_review", "verified", "rejected", "corrected",
+  ]).default("unverified").notNull(),
+  verifiedBy: varchar("verified_by", { length: 50 }),
+  verifiedAt: timestamp("verified_at"),
+  engineVersion: varchar("engine_version", { length: 20 }),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const fashionItemStyleFeatures = mysqlTable("fashion_item_style_features", {
+  id: int("id").primaryKey().autoincrement(),
+  itemId: varchar("item_id", { length: 30 }).notNull(),
+  variantId: varchar("variant_id", { length: 30 }),
+
+  yinYangBalance: decimal("yin_yang_balance", { precision: 3, scale: 2 }),
+  softness: decimal("softness", { precision: 3, scale: 2 }),
+  sharpness: decimal("sharpness", { precision: 3, scale: 2 }),
+  naturalness: decimal("naturalness", { precision: 3, scale: 2 }),
+  classicBalance: decimal("classic_balance", { precision: 3, scale: 2 }),
+  playfulness: decimal("playfulness", { precision: 3, scale: 2 }),
+  dramaLevel: decimal("drama_level", { precision: 3, scale: 2 }),
+  romanticDetail: decimal("romantic_detail", { precision: 3, scale: 2 }),
+
+  sourceMethod: mysqlEnum("source_method", STYLE_SOURCE_METHODS),
+  confidence: decimal("confidence", { precision: 3, scale: 2 }),
+  verifiedStatus: mysqlEnum("verified_status", ["unverified", "verified", "corrected"]).default("unverified").notNull(),
+  verifiedBy: varchar("verified_by", { length: 50 }),
+  engineVersion: varchar("engine_version", { length: 20 }),
+
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+export const fashionItemStyleScores = mysqlTable("fashion_item_style_scores", {
+  id: int("id").primaryKey().autoincrement(),
+  itemId: varchar("item_id", { length: 30 }).notNull(),
+  variantId: varchar("variant_id", { length: 30 }),
+
+  styleCode: mysqlEnum("style_code", STYLE_CODES).notNull(),
+  score: decimal("score", { precision: 3, scale: 2 }).notNull(),
+  isPrimary: boolean("is_primary").default(false).notNull(),
+  isSecondary: boolean("is_secondary").default(false).notNull(),
+  confidence: decimal("confidence", { precision: 3, scale: 2 }),
+
+  sourceMethod: mysqlEnum("source_method", STYLE_SOURCE_METHODS).notNull(),
+  engineVersion: varchar("engine_version", { length: 20 }),
+  verifiedStatus: mysqlEnum("verified_status", ["unverified", "verified", "corrected"]).default("unverified").notNull(),
+  verifiedBy: varchar("verified_by", { length: 50 }),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+export const fashionItemStyleTags = mysqlTable("fashion_item_style_tags", {
+  id: int("id").primaryKey().autoincrement(),
+  itemId: varchar("item_id", { length: 30 }).notNull(),
+
+  tagType: mysqlEnum("tag_type", ["signature", "conflict"]).notNull(),
+  tagCode: mysqlEnum("tag_code", [
+    "soft_feminine", "balanced_refined", "sharp_structured", "relaxed_natural",
+    "playful_contrast", "dramatic_statement", "minimal_clean", "ornate_romantic",
+    "too_oversized", "too_sharp", "too_soft", "too_ornate",
+    "too_minimal", "too_relaxed", "too_structured",
+  ]).notNull(),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const fashionItemMaterialAttributes = mysqlTable("fashion_item_material_attributes", {
+  id: int("id").primaryKey().autoincrement(),
+  itemId: varchar("item_id", { length: 30 }).notNull(),
+  variantId: varchar("variant_id", { length: 30 }),
+
+  primaryMaterial: varchar("primary_material", { length: 50 }),
+  secondaryMaterials: text("secondary_materials"),
+  materialPercentage: text("material_percentage"),
+  materialSourceText: text("material_source_text"),
+
+  materialFamily: mysqlEnum("material_family", [
+    "natural_fiber", "regenerated_fiber", "synthetic_fiber", "leather_fur", "denim", "technical", "mixed",
+  ]),
+  textureLevel: mysqlEnum("texture_level", [
+    "smooth", "fine_texture", "medium_texture", "coarse_texture",
+    "plush", "fuzzy", "ribbed", "boucle", "embossed", "other",
+  ]),
+  sheenLevel: mysqlEnum("sheen_level", ["matte", "low_sheen", "medium_sheen", "glossy", "metallic"]),
+  drapeLevel: mysqlEnum("drape_level", ["very_fluid", "fluid", "balanced", "firm", "rigid"]),
+  thicknessLevel: mysqlEnum("thickness_level", ["very_light", "light", "medium", "heavy", "very_heavy"]),
+  stretchLevel: mysqlEnum("stretch_level", ["none", "low", "medium", "high"]),
+  tactileSoftness: mysqlEnum("tactile_softness", ["very_soft", "soft", "balanced", "firm", "stiff"]),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+export const fashionVariantColorAttributes = mysqlTable("fashion_variant_color_attributes", {
+  id: int("id").primaryKey().autoincrement(),
+  variantId: varchar("variant_id", { length: 30 }).notNull(),
+
+  colorNameSource: varchar("color_name_source", { length: 100 }),
+  dominantColor: varchar("dominant_color", { length: 50 }),
+  secondaryColors: text("secondary_colors"),
+  accentColors: text("accent_colors"),
+  patternType: mysqlEnum("pattern_type", [
+    "solid", "stripe", "check", "floral", "geometric", "animal", "abstract", "mixed",
+  ]),
+  colorCount: int("color_count"),
+  colorContrastLevel: mysqlEnum("color_contrast_level", ["low", "medium", "high"]),
+
+  colorTemperature: mysqlEnum("color_temperature", [
+    "warm", "cool", "neutral_warm", "neutral_cool", "olive", "uncertain",
+  ]),
+  valueLevel: mysqlEnum("value_level", ["very_light", "light", "medium", "dark", "very_dark"]),
+  saturationLevel: mysqlEnum("saturation_level", ["very_low", "low", "medium", "high", "very_high"]),
+  neutralTendency: mysqlEnum("neutral_tendency", [
+    "none", "warm_neutral", "cool_neutral", "gray_neutral", "earthy_neutral", "olive_neutral",
+  ]),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+export const fashionVariantColorIdentity = mysqlTable("fashion_variant_color_identity", {
+  id: int("id").primaryKey().autoincrement(),
+  variantId: varchar("variant_id", { length: 30 }).notNull(),
+
+  seasonName: mysqlEnum("season_name", ["春", "夏", "长夏", "秋", "冬"]),
+  seasonElement: mysqlEnum("season_element", ["木", "火", "土", "金", "水"]),
+  elementName: mysqlEnum("element_name", ["木", "火", "土", "金", "水"]),
+  finalSeason25: varchar("final_season_25", { length: 20 }),
+  colorIdentityConfidence: decimal("color_identity_confidence", { precision: 3, scale: 2 }),
+  colorEngineVersion: varchar("color_engine_version", { length: 20 }),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+export type FashionItem = typeof fashionItems.$inferSelect;
+export type NewFashionItem = typeof fashionItems.$inferInsert;
+export type FashionItemVariant = typeof fashionItemVariants.$inferSelect;
+export type NewFashionItemVariant = typeof fashionItemVariants.$inferInsert;
+export type FashionItemFieldSource = typeof fashionItemFieldSources.$inferSelect;
+export type FashionItemStyleFeature = typeof fashionItemStyleFeatures.$inferSelect;
+export type FashionItemStyleScore = typeof fashionItemStyleScores.$inferSelect;
+export type FashionItemStyleTag = typeof fashionItemStyleTags.$inferSelect;
+export type FashionItemMaterialAttribute = typeof fashionItemMaterialAttributes.$inferSelect;
+export type FashionVariantColorAttribute = typeof fashionVariantColorAttributes.$inferSelect;
+export type FashionVariantColorIdentity = typeof fashionVariantColorIdentity.$inferSelect;

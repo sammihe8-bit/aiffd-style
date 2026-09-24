@@ -41,7 +41,7 @@ async function getOrCreateProfile(userId: number) {
 
 const PATCHABLE_FIELDS = [
   "ageRange", "heightRange",
-  "boneScale", "boneRoundness", "boneWidth", "shoulderShape", "waistType", "waistLength",
+  "boneScale", "boneRoundness", "shoulderLineDirection", "shoulderShape", "waistType", "waistLength",
   "chestProtrude", "hipProtrude", "limbLength", "handFootSize", "bodyShape", "fleshTexture",
   "mouthWidth", "mouthFullness", "cheekContour", "cheekFullness", "cheekboneProminence",
   "cheekboneShape", "chinLength", "chinShape", "eyeSize", "eyeShape", "eyeSpacing",
@@ -78,6 +78,11 @@ router.get("/me", authenticate, async (req: AuthRequest, res) => {
   try {
     const profile = await getOrCreateProfile(req.user!.id)
 
+    // 2026-09-21 兼容迁移：同时输出旧字段名 boneWidth（值跟新字段
+    // shoulderLineDirection 保持一致），给还没切换到新字段名的前端代码用。
+    // 这行和 PATCH /me 里对应的兼容分支应该一起删除，不要长期保留。
+    const profileWithLegacyAlias = { ...profile, boneWidth: profile.shoulderLineDirection }
+
     const [styleScores, lifestyleScenarios, itemPreferences, visualStylePreferences, colorSignals] = await Promise.all([
       db.select().from(profileStyleScores).where(eq(profileStyleScores.profileId, profile.profileId)),
       db.select().from(profileLifestyleScenarios).where(eq(profileLifestyleScenarios.profileId, profile.profileId)),
@@ -86,7 +91,7 @@ router.get("/me", authenticate, async (req: AuthRequest, res) => {
       db.select().from(profileColorSignals).where(eq(profileColorSignals.profileId, profile.profileId)),
     ])
 
-    res.json({ profile, styleScores, lifestyleScenarios, itemPreferences, visualStylePreferences, colorSignals })
+    res.json({ profile: profileWithLegacyAlias, styleScores, lifestyleScenarios, itemPreferences, visualStylePreferences, colorSignals })
   } catch (error) {
     console.error("Get human profile error:", error)
     res.status(500).json({ error: "获取档案失败" })
@@ -98,6 +103,16 @@ router.patch("/me", authenticate, async (req: AuthRequest, res) => {
   try {
     const { patch, source, reason, changedByUserId } = patchSchema.parse(req.body)
     const profile = await getOrCreateProfile(req.user!.id)
+
+    // 2026-09-21 兼容迁移：boneWidth 已正式改名为 shoulderLineDirection
+    // （原字段名容易和"肩宽"混淆，见 Mapping Matrix V1.0 修正版）。
+    // 这里临时兼容旧字段名一段时间，前端逐步切换到新字段名之后，
+    // 这个兼容分支和下面 GET /me 里的别名输出都应该删掉，不要让
+    // Matching Engine 新代码依赖这个旧名字。
+    if (patch.boneWidth !== undefined && patch.shoulderLineDirection === undefined) {
+      patch.shoulderLineDirection = patch.boneWidth
+      delete patch.boneWidth
+    }
 
     const validKeys = Object.keys(patch).filter(k => (PATCHABLE_FIELDS as readonly string[]).includes(k))
     if (validKeys.length === 0) {

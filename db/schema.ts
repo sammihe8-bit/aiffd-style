@@ -1,4 +1,4 @@
-import { mysqlTable, int, varchar, text, timestamp, decimal, mysqlEnum, boolean } from "drizzle-orm/mysql-core";
+import { mysqlTable, int, bigint, varchar, text, timestamp, decimal, mysqlEnum, boolean, json } from "drizzle-orm/mysql-core";
 
 // ══════════════════════════════════════════════════════════════════
 // 原有表（未改动，来自现有 aiffd-style 仓库 db/schema.ts）
@@ -577,3 +577,70 @@ export type FashionItemStyleTag = typeof fashionItemStyleTags.$inferSelect;
 export type FashionItemMaterialAttribute = typeof fashionItemMaterialAttributes.$inferSelect;
 export type FashionVariantColorAttribute = typeof fashionVariantColorAttributes.$inferSelect;
 export type FashionVariantColorIdentity = typeof fashionVariantColorIdentity.$inferSelect;
+
+// ══════════════════════════════════════════════════════════════════
+// Matching Engine —— 对齐 ③B《Matching Scoring Rules V1.0》修正版
+// 2026-09-28 新增 Drizzle 定义。三张表都已在 TiDB 用 SQL 建好：
+//   matching_reason_codes / matching_rules：2026-09-23 建表，2026-09-25 清洗为 v1.1
+//   matching_results：2026-09-25 新建
+// 说明：channel / match_type / strength 在数据库里是 ENUM，这里用 varchar
+// 声明——Matching Engine 只读取这些列，不通过 Drizzle 写入规则，
+// 用 varchar 可以避免 TypeScript 枚举和数据库枚举以后不同步导致构建失败。
+// human_value / item_value 声明为 json，但引擎读取时同时兼容字符串形式。
+// ══════════════════════════════════════════════════════════════════
+
+export const matchingReasonCodes = mysqlTable("matching_reason_codes", {
+  id: int("id").primaryKey().autoincrement(),
+  reasonCode: varchar("reason_code", { length: 50 }).notNull(),
+  channel: varchar("channel", { length: 30 }).notNull(),
+  meaning: varchar("meaning", { length: 255 }).notNull(),
+  outputDirection: mysqlEnum("output_direction", ["strength", "warning"]).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const matchingRules = mysqlTable("matching_rules", {
+  id: int("id").primaryKey().autoincrement(),
+  ruleId: varchar("rule_id", { length: 20 }).notNull(),
+  channel: varchar("channel", { length: 30 }).notNull(),
+  subDimension: varchar("sub_dimension", { length: 50 }).notNull(),
+  humanField: varchar("human_field", { length: 50 }).notNull(),
+  humanValue: json("human_value").notNull(),
+  itemField: varchar("item_field", { length: 50 }).notNull(),
+  itemValue: json("item_value").notNull(),
+  matchType: varchar("match_type", { length: 20 }).notNull(),
+  strength: varchar("strength", { length: 10 }),
+  // rule_weight 存"子维度权重"；同一子维度有多个计分单元时，由引擎在单元间平分
+  ruleWeight: decimal("rule_weight", { precision: 3, scale: 1 }),
+  isActive: boolean("is_active").default(true).notNull(),
+  constraintScope: mysqlEnum("constraint_scope", ["purchase", "recommendation", "styling", "all"]),
+  // 已废弃（deprecated）：被 compatibility × rule_weight 取代，确认无依赖后再删除
+  scoreDelta: decimal("score_delta", { precision: 6, scale: 2 }),
+  reasonCode: varchar("reason_code", { length: 50 }),
+  ruleVersion: varchar("rule_version", { length: 20 }),
+  note: text("note"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+export const matchingResults = mysqlTable("matching_results", {
+  id: bigint("id", { mode: "number" }).primaryKey().autoincrement(),
+  resultId: varchar("result_id", { length: 40 }).notNull().unique(),
+  profileId: varchar("profile_id", { length: 30 }).notNull(),
+  itemId: varchar("item_id", { length: 30 }).notNull(),
+  variantId: varchar("variant_id", { length: 30 }),
+  channel: varchar("channel", { length: 30 }).notNull(),
+  score: decimal("score", { precision: 5, scale: 2 }),
+  dataCoverage: decimal("data_coverage", { precision: 4, scale: 3 }).notNull(),
+  ruleCoverage: decimal("rule_coverage", { precision: 4, scale: 3 }),
+  confidence: decimal("confidence", { precision: 4, scale: 3 }),
+  engineVersion: varchar("engine_version", { length: 20 }).notNull(),
+  profileVersion: int("profile_version").notNull(),
+  itemUpdatedAt: timestamp("item_updated_at"),
+  calculatedAt: timestamp("calculated_at").defaultNow().notNull(),
+  resultDetailJson: json("result_detail_json"),
+});
+
+export type MatchingReasonCode = typeof matchingReasonCodes.$inferSelect;
+export type MatchingRule = typeof matchingRules.$inferSelect;
+export type MatchingResult = typeof matchingResults.$inferSelect;
+export type NewMatchingResult = typeof matchingResults.$inferInsert;

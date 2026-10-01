@@ -1,4 +1,4 @@
-import { ENGINE_VERSION, scoreBand, round, Eligibility } from "./matching-core";
+import { ENGINE_VERSION, scoreBand, round, Eligibility, assertRange, EngineNumericError } from "./matching-core";
 
 // ══════════════════════════════════════════════════════════════════
 // AIFFD Matching Engine V1.0 —— 七维汇总层（纯函数，不访问数据库）
@@ -34,8 +34,9 @@ export const SCENARIO_ADJUSTMENT_PCT: Record<Scenario, Record<Dimension, number>
 };
 
 // ③C 第三节：用户优先级，一次最多一个维度，只加不减
-export const PRIORITY_INCREMENT_PCT = { low: 1, medium: 3, high: 5 } as const;
-export type PriorityLevel = keyof typeof PRIORITY_INCREMENT_PCT;
+export const PRIORITY_LEVELS = ["low", "medium", "high"] as const;
+export type PriorityLevel = typeof PRIORITY_LEVELS[number];
+export const PRIORITY_INCREMENT_PCT: Readonly<Record<PriorityLevel, number>> = { low: 1, medium: 3, high: 5 };
 export type Priority = { dimension: Dimension; level: PriorityLevel };
 
 // ③C 第四节：门槛
@@ -76,9 +77,28 @@ export interface AggregateInput {
   profile_version: number;
 }
 
+// 汇总层输入检查（03D P0 / P1）：数值必须有限且在值域内；
+// 有分数的维度必须带 confidence，有数据的维度必须带 rule_coverage，不能静默跳过后重归一化
+function checkDimensionInput(d: Dimension, r: DimensionInput) {
+  assertRange(`${d}.score`, r.score, 0, 100, true);
+  assertRange(`${d}.data_coverage`, r.data_coverage, 0, 1, false);
+  assertRange(`${d}.rule_coverage`, r.rule_coverage, 0, 1, true);
+  assertRange(`${d}.confidence`, r.confidence, 0, 1, true);
+  if (r.score !== null && r.confidence === null) throw new EngineNumericError(`${d}.confidence`, null);
+  if (r.data_coverage > 0 && r.rule_coverage === null) throw new EngineNumericError(`${d}.rule_coverage`, null);
+}
+
 export function aggregate(input: AggregateInput) {
   const scenario = input.scenario ?? null;
   const priority = input.priority ?? null;
+  if (scenario !== null && !SCENARIOS.includes(scenario)) throw new EngineNumericError("scenario", scenario);
+  if (priority !== null && (!DIMENSIONS.includes(priority.dimension) || !PRIORITY_LEVELS.includes(priority.level))) {
+    throw new EngineNumericError("priority", priority);
+  }
+  for (const d of DIMENSIONS) {
+    const r = input.dimensions[d];
+    if (r) checkDimensionInput(d, r);
+  }
 
   const state = {} as Record<Dimension, DimensionState>;
   for (const d of DIMENSIONS) {
@@ -159,6 +179,16 @@ export function aggregate(input: AggregateInput) {
     for (const c of r.warnings) warnings.push({ source: "rule", code: c, dimension: d });
   }
 
+  // 输出检查
+  const outDataCov = round(dataCov, 3);
+  const outRuleCov = ruleDen > 0 ? round(ruleNum / ruleDen, 3) : null;
+  const outConf = confDen > 0 ? round(confNum / confDen, 3) : null;
+  assertRange("overall.match_score", matchScore, 0, 100, true);
+  assertRange("overall.data_coverage", outDataCov, 0, 1, false);
+  assertRange("overall.rule_coverage", outRuleCov, 0, 1, true);
+  assertRange("overall.confidence", outConf, 0, 1, true);
+  for (const d of DIMENSIONS) assertRange(`weights_used.${d}`, weightsUsed[d], 0, 1, false);
+
   const dimensions = {} as Record<Dimension, (DimensionInput & { state: DimensionState }) | null>;
   for (const d of DIMENSIONS) {
     const r = input.dimensions[d];
@@ -173,9 +203,9 @@ export function aggregate(input: AggregateInput) {
     score_band: scoreBand(matchScore),
     dimension_coverage: coveragePct / 100,
     valid_dimensions: valid.length,
-    data_coverage: round(dataCov, 3),
-    rule_coverage: ruleDen > 0 ? round(ruleNum / ruleDen, 3) : null,
-    confidence: confDen > 0 ? round(confNum / confDen, 3) : null,
+    data_coverage: outDataCov,
+    rule_coverage: outRuleCov,
+    confidence: outConf,
     purchase_eligibility: eligibility.purchase,
     recommendation_eligibility: eligibility.recommendation,
     styling_eligibility: eligibility.styling,
@@ -209,6 +239,9 @@ export function selectForDisplay(strengths: Explanation[], warnings: Explanation
 }
 
 // ── 请求参数校验（③C 第三节：优先级一次最多一个维度）─────────────
+// 只读对象自有属性，只接受固定字符串；[null]、嵌套数组、toString / __proto__ 等一律拒绝（03D P0）
+const own = (o: object, k: string): unknown => (Object.prototype.hasOwnProperty.call(o, k) ? (o as Record<string, unknown>)[k] : undefined);
+
 export function parsePriority(raw: unknown): { ok: true; value: Priority | null } | { ok: false; error: string } {
   if (raw === undefined || raw === null) return { ok: true, value: null };
   if (Array.isArray(raw)) {
@@ -216,8 +249,10 @@ export function parsePriority(raw: unknown): { ok: true; value: Priority | null 
     if (raw.length > 1) return { ok: false, error: "priority 一次最多指定一个维度" };
     raw = raw[0];
   }
-  const p = raw as { dimension?: unknown; level?: unknown };
-  if (typeof p !== "object" || !DIMENSIONS.includes(p.dimension as Dimension)) return { ok: false, error: "priority.dimension 不合法" };
-  if (!(String(p.level) in PRIORITY_INCREMENT_PCT)) return { ok: false, error: "priority.level 只能是 low / medium / high" };
-  return { ok: true, value: { dimension: p.dimension as Dimension, level: p.level as PriorityLevel } };
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "priority 格式不合法" };
+  const dimension = own(raw, "dimension");
+  const level = own(raw, "level");
+  if (typeof dimension !== "string" || !(DIMENSIONS as readonly string[]).includes(dimension)) return { ok: false, error: "priority.dimension 不合法" };
+  if (typeof level !== "string" || !(PRIORITY_LEVELS as readonly string[]).includes(level)) return { ok: false, error: "priority.level 只能是 low / medium / high" };
+  return { ok: true, value: { dimension: dimension as Dimension, level: level as PriorityLevel } };
 }

@@ -11,7 +11,7 @@ import { eq, and, desc, isNull } from "drizzle-orm";
 import { authenticate, AuthRequest } from "../middleware/auth";
 import {
   ENGINE_VERSION, computeDimension, validateRuleSet, isHardConstraint, itemSourceConfidence,
-  HUMAN_SOURCE_CONFIDENCE, HUMAN_NO_RECORD_CONFIDENCE, ITEM_NO_RECORD_CONFIDENCE,
+  HUMAN_SOURCE_CONFIDENCE, HUMAN_NO_RECORD_CONFIDENCE, ITEM_NO_RECORD_CONFIDENCE, EngineNumericError,
 } from "./matching-core";
 import { aggregate, parsePriority, SCENARIOS, Dimension, DimensionInput } from "./matching-aggregate";
 
@@ -200,6 +200,11 @@ router.post("/score", authenticate, async (req: AuthRequest, res) => {
     res.json(result.body);
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: "请求参数错误", details: error.errors });
+    if (error instanceof EngineNumericError) {
+      // 只记录字段名，不记录用户数据
+      console.error("Matching score numeric error:", error.field);
+      return res.status(500).json({ error: "匹配计算失败", code: "ENGINE_NUMERIC_ERROR" });
+    }
     console.error("Matching score error:", error);
     res.status(500).json({ error: "匹配计算失败" });
   }
@@ -239,6 +244,11 @@ router.post("/match", authenticate, async (req: AuthRequest, res) => {
     res.json({ item_id: itemId, variant_id: variantId ?? null, profile_id: profiles[0].profileId, ...overall, skipped_dimensions: skipped });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: "请求参数错误", details: error.errors });
+    if (error instanceof EngineNumericError) {
+      // 只记录字段名，不记录用户数据
+      console.error("Matching match numeric error:", error.field);
+      return res.status(500).json({ error: "匹配计算失败", code: "ENGINE_NUMERIC_ERROR" });
+    }
     console.error("Matching match error:", error);
     res.status(500).json({ error: "匹配计算失败" });
   }

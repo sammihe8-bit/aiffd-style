@@ -424,7 +424,7 @@ export async function computeDimension(input: ComputeInput) {
 
   return {
     dimensionResult,
-        // 未四舍五入的值，供汇总层做 0.30 门槛判断和权重计算（③C 第四节）
+    // 未四舍五入的值，供汇总层做 0.30 门槛判断和权重计算（③C 第四节）
     exact: { data_coverage: totalW > 0 ? applicableW / totalW : 0 },
     detail: {
       rule_results: ruleResults,

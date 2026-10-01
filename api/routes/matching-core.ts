@@ -417,6 +417,7 @@ export async function computeDimension(input: ComputeInput) {
     rules_applied: ruleResults.length,
     default_neutral_units: units.filter(u => u.status === "default_neutral").length,
     units_skipped: units.filter(u => u.status === "not_applicable" || u.status === "validation_error").length,
+    constraints_triggered: constraintResults.filter(c => c.status === "triggered").length,
     // 本次实际参与判定的规则版本（如实列出，可能不止一个；未填版本的规则记为 null）
     rule_versions: [...new Set(rules.map(r => r.ruleVersion ?? null))].sort((a, b) => String(a).localeCompare(String(b))),
   };

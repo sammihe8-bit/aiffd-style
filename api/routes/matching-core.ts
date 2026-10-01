@@ -132,6 +132,18 @@ export function toStringArray(v: unknown): string[] {
 
 export const round = (n: number, d: number) => Math.round(n * 10 ** d) / 10 ** d;
 
+// ── 数值防护（03D P0）：任何非有限数或越界值都视为引擎缺陷，拒绝返回和落库 ──
+export class EngineNumericError extends Error {
+  code = "ENGINE_NUMERIC_ERROR" as const;
+  constructor(public field: string, public value: unknown) {
+    super(`ENGINE_NUMERIC_ERROR: ${field}`);
+  }
+}
+export function assertRange(field: string, v: unknown, min: number, max: number, nullable: boolean) {
+  if (v === null && nullable) return;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) throw new EngineNumericError(field, v);
+}
+
 // ── Human 侧取值 ─────────────────────────────────────────────────
 // 单选的运行时校验字段（waist_type），③C 第七节：
 //   单个合法值              → ok
@@ -175,10 +187,19 @@ function ruleHits(r: MatchingRule, humanVals: string[], itemVal: string): boolea
 }
 
 // ── 规则校验（③B 第四节）──────────────────────────────────────────
-export type RuleValidationError = { rule_id: string; problem: string };
+export type RuleValidationError = {
+  code: "RULE_VALIDATION_ERROR" | "RULE_CONFIGURATION_ERROR";
+  rule_id: string;
+  problem: string;
+};
+
+const CONSTRAINT_SCOPES = ["purchase", "recommendation", "styling", "all"];
 
 export function validateRule(rule: MatchingRule): string[] {
   const problems: string[] = [];
+  if (typeof rule.subDimension !== "string" || rule.subDimension.trim() === "") problems.push("sub_dimension 为空");
+  if (toStringArray(rule.humanValue).length === 0) problems.push("human_value 为空");
+  if (toStringArray(rule.itemValue).length === 0) problems.push("item_value 为空");
   const h = HUMAN_FIELDS[rule.humanField];
   const it = ITEM_FIELDS[rule.itemField];
   if (!h) problems.push(`未注册的 human_field: ${rule.humanField}`);
@@ -197,33 +218,49 @@ export function validateRule(rule: MatchingRule): string[] {
   if (isHardConstraint(rule)) {
     // 硬约束不参与计分，不需要 compatibility 和 rule_weight
     if (!rule.constraintScope) problems.push("hard_constraint 缺少 constraint_scope");
+    else if (!CONSTRAINT_SCOPES.includes(rule.constraintScope)) problems.push(`constraint_scope 非法: ${rule.constraintScope}`);
   } else {
     if (compatibilityOf(rule.matchType, rule.strength) === undefined) {
       problems.push(`match_type/strength 组合无效: ${rule.matchType}/${rule.strength}`);
     }
     if (rule.ruleWeight === null || rule.ruleWeight === undefined) problems.push("缺少 rule_weight");
+    else {
+      const w = Number(rule.ruleWeight);
+      if (!Number.isFinite(w) || w <= 0) problems.push(`rule_weight 必须是大于 0 的有限数: ${rule.ruleWeight}`);
+    }
   }
   return problems;
 }
 
-// 逐条校验 + 规则集层面的校验（同一子维度的计分规则 rule_weight 必须一致）
+// 逐条校验 + 规则集层面的校验
+// 同一子维度的计分规则 rule_weight 必须一致；不一致时该子维度的计分规则整组排除（03D P0），
+// 不能只报告后照常计分。硬约束不参与这项检查。
 export function validateRuleSet(all: MatchingRule[]) {
-  const valid: MatchingRule[] = [];
+  const passed: MatchingRule[] = [];
   const errors: RuleValidationError[] = [];
   for (const r of all) {
     const problems = validateRule(r);
-    if (problems.length > 0) problems.forEach(p => errors.push({ rule_id: r.ruleId, problem: p }));
-    else valid.push(r);
+    if (problems.length > 0) problems.forEach(p => errors.push({ code: "RULE_VALIDATION_ERROR", rule_id: r.ruleId, problem: p }));
+    else passed.push(r);
   }
-  const weightBySub = new Map<string, Set<string>>();
-  for (const r of valid) {
+  const weightBySub = new Map<string, Set<number>>();
+  for (const r of passed) {
     if (isHardConstraint(r)) continue;
     if (!weightBySub.has(r.subDimension)) weightBySub.set(r.subDimension, new Set());
-    weightBySub.get(r.subDimension)!.add(String(Number(r.ruleWeight)));
+    weightBySub.get(r.subDimension)!.add(Number(r.ruleWeight));
   }
+  const badSubs = new Set<string>();
   for (const [sub, ws] of weightBySub) {
-    if (ws.size > 1) errors.push({ rule_id: `(${sub})`, problem: `同一子维度 rule_weight 不一致: ${[...ws].join(", ")}` });
+    if (ws.size > 1) {
+      badSubs.add(sub);
+      for (const r of passed) {
+        if (!isHardConstraint(r) && r.subDimension === sub) {
+          errors.push({ code: "RULE_CONFIGURATION_ERROR", rule_id: r.ruleId, problem: `子维度「${sub}」rule_weight 不一致（${[...ws].join(", ")}），整组排除` });
+        }
+      }
+    }
   }
+  const valid = passed.filter(r => isHardConstraint(r) || !badSubs.has(r.subDimension));
   return { valid, errors };
 }
 
@@ -307,7 +344,7 @@ export async function computeDimension(input: ComputeInput) {
       const err = { ...base, status: "validation_error" as UnitStatus, reason: human.reason };
       units.push(err);
       unitValidationErrors.push(err);
-      log("[matching] 用户数据校验异常，跳过计分单元:", err);
+      log("[matching] 用户数据校验异常，跳过计分单元:", { channel, sub_dimension: subDimension, human_field: humanField, item_field: itemField, reason: human.reason });
       continue;
     }
 
@@ -332,7 +369,7 @@ export async function computeDimension(input: ComputeInput) {
       const err = { ...base, status: "validation_error" as UnitStatus, reason: "multiple_rules_hit", rule_ids: hits.map(h => h.ruleId) };
       units.push(err);
       unitValidationErrors.push(err);
-      log("[matching] 计分单元命中多条规则:", err);
+      log("[matching] 计分单元命中多条规则:", { channel, sub_dimension: subDimension, human_field: humanField, item_field: itemField, reason: "multiple_rules_hit", rule_ids: err.rule_ids });
       continue;
     }
 
@@ -387,7 +424,7 @@ export async function computeDimension(input: ComputeInput) {
     let status: ConstraintStatus;
     if (human.kind === "invalid") {
       status = "validation_error";
-      log("[matching] 硬约束用户数据校验异常，未判定:", { ...base, reason: human.reason });
+      log("[matching] 硬约束用户数据校验异常，未判定:", { channel, rule_id: r.ruleId, human_field: r.humanField, item_field: r.itemField, reason: human.reason });
     } else if (human.kind === "missing" || itemVal === null) {
       // 证据不足时不关闭资格
       status = "not_evaluable";
@@ -403,6 +440,14 @@ export async function computeDimension(input: ComputeInput) {
       if (scope === "styling" || scope === "all") eligibility.styling = false;
     }
   }
+
+  // 输出前最后一道检查：出现 NaN / Infinity / 越界即抛错，路由层不会落库
+  const exactDataCoverage = totalW > 0 ? applicableW / totalW : 0;
+  assertRange(`${channel}.score`, score, 0, 100, true);
+  assertRange(`${channel}.data_coverage`, dataCoverage, 0, 1, false);
+  assertRange(`${channel}.data_coverage_exact`, exactDataCoverage, 0, 1, false);
+  assertRange(`${channel}.rule_coverage`, ruleCoverage, 0, 1, true);
+  assertRange(`${channel}.confidence`, confidence, 0, 1, true);
 
   const dimensionResult = {
     dimension: channel,
@@ -425,7 +470,7 @@ export async function computeDimension(input: ComputeInput) {
   return {
     dimensionResult,
     // 未四舍五入的值，供汇总层做 0.30 门槛判断和权重计算（③C 第四节）
-    exact: { data_coverage: totalW > 0 ? applicableW / totalW : 0 },
+    exact: { data_coverage: exactDataCoverage },
     detail: {
       rule_results: ruleResults,
       units,

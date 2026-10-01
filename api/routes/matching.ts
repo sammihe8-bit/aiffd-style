@@ -13,6 +13,7 @@ import {
   ENGINE_VERSION, computeDimension, validateRuleSet, isHardConstraint, itemSourceConfidence,
   HUMAN_SOURCE_CONFIDENCE, HUMAN_NO_RECORD_CONFIDENCE, ITEM_NO_RECORD_CONFIDENCE,
 } from "./matching-core";
+import { aggregate, parsePriority, SCENARIOS, Dimension, DimensionInput } from "./matching-aggregate";
 
 // ══════════════════════════════════════════════════════════════════
 // AIFFD Matching Engine V1.0 —— 路由与数据读取
@@ -37,27 +38,29 @@ async function loadValidatedRules(channel: string) {
 }
 
 // ── 数据读取 ─────────────────────────────────────────────────────
-async function latestHumanSource(profileId: string, fieldName: string) {
-  const rows = await db.select({ source: profileFieldChangeLog.source }).from(profileFieldChangeLog)
-    .where(and(eq(profileFieldChangeLog.profileId, profileId), eq(profileFieldChangeLog.fieldName, fieldName)))
-    .orderBy(desc(profileFieldChangeLog.id)).limit(1);
-  return rows[0]?.source ?? null;
+// 来源记录一次性批量读取（原来每个字段查一次），按 id 倒序取每个字段的最新一条
+async function loadHumanSources(profileId: string) {
+  const rows = await db.select({ fieldName: profileFieldChangeLog.fieldName, source: profileFieldChangeLog.source })
+    .from(profileFieldChangeLog)
+    .where(eq(profileFieldChangeLog.profileId, profileId))
+    .orderBy(desc(profileFieldChangeLog.id));
+  const latest = new Map<string, string>();
+  for (const r of rows) if (!latest.has(r.fieldName)) latest.set(r.fieldName, r.source);
+  return latest;
 }
 
-async function latestItemSource(itemId: string, variantId: string | null, fieldName: string) {
-  // 优先取变体级溯源记录，没有再取商品级
-  if (variantId) {
-    const v = await db.select().from(fashionItemFieldSources)
-      .where(and(eq(fashionItemFieldSources.itemId, itemId), eq(fashionItemFieldSources.variantId, variantId),
-        eq(fashionItemFieldSources.fieldName, fieldName)))
-      .orderBy(desc(fashionItemFieldSources.id)).limit(1);
-    if (v[0]) return v[0];
+// 优先取变体级溯源记录，没有再取商品级；其他变体的记录忽略
+async function loadItemSources(itemId: string, variantId: string | null) {
+  const rows = await db.select().from(fashionItemFieldSources)
+    .where(eq(fashionItemFieldSources.itemId, itemId))
+    .orderBy(desc(fashionItemFieldSources.id));
+  const variantLevel = new Map<string, typeof rows[number]>();
+  const itemLevel = new Map<string, typeof rows[number]>();
+  for (const r of rows) {
+    if (variantId && r.variantId === variantId) { if (!variantLevel.has(r.fieldName)) variantLevel.set(r.fieldName, r); }
+    else if (r.variantId === null) { if (!itemLevel.has(r.fieldName)) itemLevel.set(r.fieldName, r); }
   }
-  const i = await db.select().from(fashionItemFieldSources)
-    .where(and(eq(fashionItemFieldSources.itemId, itemId), isNull(fashionItemFieldSources.variantId),
-      eq(fashionItemFieldSources.fieldName, fieldName)))
-    .orderBy(desc(fashionItemFieldSources.id)).limit(1);
-  return i[0] ?? null;
+  return (field: string) => variantLevel.get(field) ?? itemLevel.get(field) ?? null;
 }
 
 async function loadMaterial(itemId: string, variantId: string | null) {
@@ -93,17 +96,22 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
   const reasonRows = await db.select().from(matchingReasonCodes);
   const reasonDir = new Map(reasonRows.map(r => [r.reasonCode, r.outputDirection as string]));
 
-  const { dimensionResult, detail: coreDetail } = await computeDimension({
+  const [humanSources, itemSourceOf] = await Promise.all([
+    loadHumanSources(profile.profileId),
+    loadItemSources(itemId, variantId),
+  ]);
+
+  const { dimensionResult, detail: coreDetail, exact } = await computeDimension({
     channel, rules, reasonDir,
     profile: profile as unknown as Record<string, unknown>,
     item: item as unknown as Record<string, unknown>,
     material: material as unknown as Record<string, unknown> | null,
     humanConfidence: async (field) => {
-      const src = await latestHumanSource(profile.profileId, field);
+      const src = humanSources.get(field);
       return src ? (HUMAN_SOURCE_CONFIDENCE[src] ?? HUMAN_NO_RECORD_CONFIDENCE) : HUMAN_NO_RECORD_CONFIDENCE;
     },
     itemConfidence: async (field) => {
-      const src = await latestItemSource(itemId, variantId, field);
+      const src = itemSourceOf(field);
       return src ? itemSourceConfidence(src.sourceMethod, src.verifiedStatus) : ITEM_NO_RECORD_CONFIDENCE;
     },
   });
@@ -136,8 +144,24 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
     resultDetailJson: { ...detail, eligibility: dimensionResult.eligibility },
   });
 
+  // 汇总层需要的输入（data_coverage 用未四舍五入的值）
+  const aggregateInput: DimensionInput = {
+    result_id: resultId,
+    score: dimensionResult.score,
+    data_coverage: exact.data_coverage,
+    rule_coverage: dimensionResult.rule_coverage,
+    confidence: dimensionResult.confidence,
+    eligibility: dimensionResult.eligibility,
+    strengths: dimensionResult.strengths,
+    warnings: dimensionResult.warnings,
+    unit_validation_error_count: coreDetail.unit_validation_errors.length,
+    engine_version: ENGINE_VERSION,
+    rule_versions: dimensionResult.rule_versions,
+  };
+
   return {
     status: 200 as const,
+    aggregateInput,
     body: {
       result_id: resultId,
       engine_version: ENGINE_VERSION,
@@ -177,6 +201,45 @@ router.post("/score", authenticate, async (req: AuthRequest, res) => {
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: "请求参数错误", details: error.errors });
     console.error("Matching score error:", error);
+    res.status(500).json({ error: "匹配计算失败" });
+  }
+});
+
+// POST /match —— 当前登录用户 × 指定商品，计算所有已上线维度并按 ③C 汇总
+// 目前只有 body_fit 上线，所以总分一定是 insufficient_coverage（③C 第五节），这是预期行为
+const matchSchema = z.object({
+  itemId: z.string().min(1).max(30),
+  variantId: z.string().min(1).max(30).optional(),
+  scenario: z.enum(SCENARIOS).optional(),
+  priority: z.unknown().optional(),
+});
+
+router.post("/match", authenticate, async (req: AuthRequest, res) => {
+  try {
+    const { itemId, variantId, scenario, priority: rawPriority } = matchSchema.parse(req.body);
+    const priority = parsePriority(rawPriority);
+    if (!priority.ok) return res.status(400).json({ error: "请求参数错误", details: priority.error });
+
+    const profiles = await db.select().from(humanStyleProfiles).where(eq(humanStyleProfiles.userId, req.user!.id)).limit(1);
+    if (profiles.length === 0) return res.status(404).json({ error: "还没有风格档案，请先完成测试" });
+
+    const dimensions: Partial<Record<Dimension, DimensionInput>> = {};
+    const skipped: { dimension: string; status: number; error: string }[] = [];
+    for (const channel of SUPPORTED_CHANNELS) {
+      const r = await scoreChannel(channel, profiles[0], itemId, variantId ?? null);
+      if (r.status === 404) return res.status(404).json({ error: r.error });
+      if (r.status !== 200) { skipped.push({ dimension: channel, status: r.status, error: r.error }); continue; }
+      dimensions[channel as Dimension] = r.aggregateInput;
+    }
+
+    const overall = aggregate({
+      dimensions, scenario: scenario ?? null, priority: priority.value,
+      profile_version: profiles[0].profileVersion,
+    });
+    res.json({ item_id: itemId, variant_id: variantId ?? null, profile_id: profiles[0].profileId, ...overall, skipped_dimensions: skipped });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ error: "请求参数错误", details: error.errors });
+    console.error("Matching match error:", error);
     res.status(500).json({ error: "匹配计算失败" });
   }
 });

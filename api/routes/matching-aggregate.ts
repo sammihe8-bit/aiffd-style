@@ -1,232 +1,223 @@
-// 运行：npm run test:matching
-// 离线测试 matching-aggregate.ts，覆盖 ③C 第十三节验收用例。
-import assert from "node:assert/strict";
-import {
-  aggregate, parsePriority, selectForDisplay, DimensionInput, Dimension,
-  DIMENSIONS, SCENARIOS, SCENARIO_ADJUSTMENT_PCT, DEFAULT_WEIGHT_PCT,
-} from "../api/routes/matching-aggregate";
+import { ENGINE_VERSION, scoreBand, round, Eligibility } from "./matching-core";
 
-let passed = 0;
-const tests: [string, () => void][] = [];
-const test = (name: string, fn: () => void) => tests.push([name, fn]);
+// ══════════════════════════════════════════════════════════════════
+// AIFFD Matching Engine V1.0 —— 七维汇总层（纯函数，不访问数据库）
+// 对齐 ③C《Match Score & Explainability Spec V1.0》（2026-09-30）
+//
+//   输入：各维度的 Dimension Result（缺失维度传 null 或不传）+ 场景 + 用户优先级
+//   输出：match_score / score_band / overall_status / dimension_coverage /
+//         总层 data_coverage、rule_coverage、confidence / weights_used /
+//         三项 eligibility / strengths / warnings / diagnostics / adjustments
+//
+// 内部权重一律用"整数百分点"计算，避免 0.1 + 0.2 这类浮点误差影响 50% 门槛判断。
+// ══════════════════════════════════════════════════════════════════
 
-const dim = (score: number | null, dataCov: number, p: Partial<DimensionInput> = {}): DimensionInput => ({
-  score, data_coverage: dataCov, rule_coverage: 0.8, confidence: 0.8,
-  eligibility: { purchase: true, recommendation: true, styling: true },
-  strengths: [], warnings: [], unit_validation_error_count: 0,
-  engine_version: "matching_v1.0", rule_versions: ["v1.1"], ...p,
-});
-const run = (dimensions: Partial<Record<Dimension, DimensionInput>>, extra: object = {}) =>
-  aggregate({ dimensions, profile_version: 7, ...extra });
+export const DIMENSIONS = [
+  "body_fit", "face_fit", "style_fit", "color_fit", "preference_fit", "scenario_fit", "budget_fit",
+] as const;
+export type Dimension = typeof DIMENSIONS[number];
 
-const noNaN = (r: any) => {
-  for (const k of ["match_score", "dimension_coverage", "data_coverage", "rule_coverage", "confidence"]) {
-    const v = r[k];
-    assert.ok(v === null || Number.isFinite(v), `${k} 不应为 NaN/Infinity，实际 ${v}`);
-  }
-  for (const d of DIMENSIONS) assert.ok(Number.isFinite(r.weights_used[d]), `weights_used.${d}`);
+// ③C 第二节：默认权重（百分点），合计 100
+export const DEFAULT_WEIGHT_PCT: Record<Dimension, number> = {
+  body_fit: 20, face_fit: 10, style_fit: 20, color_fit: 20,
+  preference_fit: 15, scenario_fit: 10, budget_fit: 5,
 };
 
-// ── 配置本身 ─────────────────────────────────────────────────────
-test("默认权重合计 100", () => {
-  assert.equal(Object.values(DEFAULT_WEIGHT_PCT).reduce((a, b) => a + b, 0), 100);
-});
+// ③C 第二节：场景枚举与调权矩阵。矩阵批准前全部为 0
+export const SCENARIOS = ["work", "social", "travel", "casual", "formal", "other"] as const;
+export type Scenario = typeof SCENARIOS[number];
+export const SCENARIO_MATRIX_VERSION = "none_v1.0";
+const ZERO: Record<Dimension, number> = Object.fromEntries(DIMENSIONS.map(d => [d, 0])) as Record<Dimension, number>;
+export const SCENARIO_ADJUSTMENT_PCT: Record<Scenario, Record<Dimension, number>> = {
+  work: { ...ZERO }, social: { ...ZERO }, travel: { ...ZERO },
+  casual: { ...ZERO }, formal: { ...ZERO }, other: { ...ZERO },
+};
 
-test("六个场景的七维调整量全部为 0，向量和为 0", () => {
-  assert.deepEqual([...SCENARIOS], ["work", "social", "travel", "casual", "formal", "other"]);
-  for (const s of SCENARIOS) {
-    for (const d of DIMENSIONS) assert.equal(SCENARIO_ADJUSTMENT_PCT[s][d], 0, `${s}.${d}`);
-    assert.equal(DIMENSIONS.reduce((sum, d) => sum + SCENARIO_ADJUSTMENT_PCT[s][d], 0), 0);
-  }
-});
+// ③C 第三节：用户优先级，一次最多一个维度，只加不减
+export const PRIORITY_INCREMENT_PCT = { low: 1, medium: 3, high: 5 } as const;
+export type PriorityLevel = keyof typeof PRIORITY_INCREMENT_PCT;
+export type Priority = { dimension: Dimension; level: PriorityLevel };
 
-// ── ③C 第十二节示例 ───────────────────────────────────────────────
-test("③C 示例：Body/Style/Color = 80/70/90，coverage 1/0.5/1 → 82.00", () => {
-  const r = run({ body_fit: dim(80, 1), style_fit: dim(70, 0.5), color_fit: dim(90, 1) });
-  assert.equal(r.overall_status, "ok");
-  assert.equal(r.dimension_coverage, 0.6);
-  assert.equal(r.weights_used.body_fit, 0.4);
-  assert.equal(r.weights_used.style_fit, 0.2);
-  assert.equal(r.weights_used.color_fit, 0.4);
-  assert.equal(r.match_score, 82);
-  assert.equal(r.score_band!.band, "high_match");
-  assert.equal(r.data_coverage, 0.5);
-  assert.equal(r.rule_coverage, 0.8);
-  assert.equal(r.confidence, 0.8);
-  assert.equal(r.dimensions.face_fit, null);
-  assert.equal(r.weights_used.face_fit, 0);
-  noNaN(r);
-});
+// ③C 第四节：门槛
+export const MIN_DIMENSION_DATA_COVERAGE = 0.3;
+export const MIN_VALID_DIMENSIONS = 3;
+export const MIN_DIMENSION_COVERAGE_PCT = 50;
 
-// ── 门槛（③C 第四节表格）────────────────────────────────────────
-test("Face + Preference + Scenario + Budget：4 维但只覆盖 0.40 → insufficient", () => {
-  const r = run({ face_fit: dim(80, 1), preference_fit: dim(80, 1), scenario_fit: dim(80, 1), budget_fit: dim(80, 1) });
-  assert.equal(r.dimension_coverage, 0.4);
-  assert.equal(r.overall_status, "insufficient_coverage");
-  assert.equal(r.match_score, null);
-  assert.equal(r.score_band, null);
-});
-
-test("Body + Style + Preference：0.55 → 可计算", () => {
-  const r = run({ body_fit: dim(80, 1), style_fit: dim(80, 1), preference_fit: dim(80, 1) });
-  assert.equal(r.dimension_coverage, 0.55);
-  assert.equal(r.overall_status, "ok");
-  assert.equal(r.match_score, 80);
-});
-
-test("Body + Color：2 维 0.40 → insufficient", () => {
-  const r = run({ body_fit: dim(80, 1), color_fit: dim(80, 1) });
-  assert.equal(r.overall_status, "insufficient_coverage");
-});
-
-test("恰好 50%：Body + Face + Preference + Budget（20+10+15+5）→ 可计算，无浮点误差", () => {
-  const r = run({ body_fit: dim(80, 1), face_fit: dim(80, 1), preference_fit: dim(80, 1), budget_fit: dim(80, 1) });
-  assert.equal(r.dimension_coverage, 0.5);
-  assert.equal(r.overall_status, "ok");
-});
-
-test("仅 Body Fit（当前线上状态）：0.20，weights_used.body_fit = 1，总分与 band 为 null", () => {
-  const r = run({ body_fit: dim(78.33, 0.6, { rule_coverage: 0.611 }) });
-  assert.equal(r.overall_status, "insufficient_coverage");
-  assert.equal(r.dimension_coverage, 0.2);
-  assert.equal(r.weights_used.body_fit, 1);
-  assert.equal(r.match_score, null);
-  assert.equal(r.score_band, null);
-  assert.equal(r.confidence, 0.8);            // 不足时仍可汇总 confidence 供诊断
-  assert.equal(r.data_coverage, 0.12);        // 0.20 × 0.6
-  assert.equal(r.rule_coverage, 0.611);
-  assert.equal(r.dimensions.body_fit!.state, "valid");
-  assert.deepEqual(r.display.independent, ["INSUFFICIENT_COVERAGE"]);
-  noNaN(r);
-});
-
-// ── 单维度 0.30 边界 ─────────────────────────────────────────────
-test("data_coverage 0.30 有效；0.29 invalid、权重为 0、仍计入总层 data_coverage", () => {
-  const ok = run({ body_fit: dim(80, 1), style_fit: dim(80, 1), color_fit: dim(80, 0.3) });
-  assert.equal(ok.dimensions.color_fit!.state, "valid");
-  assert.equal(ok.overall_status, "ok");
-
-  const bad = run({ body_fit: dim(80, 1), style_fit: dim(80, 1), color_fit: dim(20, 0.29) });
-  assert.equal(bad.dimensions.color_fit!.state, "invalid");
-  assert.equal(bad.weights_used.color_fit, 0);
-  assert.equal(bad.overall_status, "insufficient_coverage");
-  assert.equal(bad.data_coverage, round3(0.2 + 0.2 + 0.2 * 0.29));
-});
-
-test("未四舍五入比较：0.2999 → invalid（不会被四舍五入成 0.30）", () => {
-  const r = run({ body_fit: dim(80, 0.2999) });
-  assert.equal(r.dimensions.body_fit!.state, "invalid");
-});
-
-test("维度没有可执行单元（score null、coverage 0）→ invalid，不当作 0 分", () => {
-  const r = run({ body_fit: dim(null, 0, { rule_coverage: null, confidence: null }), style_fit: dim(80, 1), color_fit: dim(80, 1) });
-  assert.equal(r.dimensions.body_fit!.state, "invalid");
-  assert.equal(r.overall_status, "insufficient_coverage");
-  noNaN(r);
-});
-
-test("七维全部缺失：weights_used 全为 0，总层指标为 0 / null，无 NaN", () => {
-  const r = run({});
-  assert.equal(r.data_coverage, 0);
-  assert.equal(r.rule_coverage, null);
-  assert.equal(r.confidence, null);
-  for (const d of DIMENSIONS) assert.equal(r.weights_used[d], 0);
-  noNaN(r);
-});
-
-// ── 优先级 ──────────────────────────────────────────────────────
-test("Priority high +5：只加所选维度，改变权重但不改变覆盖率门槛", () => {
-  const base = run({ body_fit: dim(100, 1), style_fit: dim(50, 1), color_fit: dim(50, 1) });
-  const pri = run({ body_fit: dim(100, 1), style_fit: dim(50, 1), color_fit: dim(50, 1) }, { priority: { dimension: "body_fit", level: "high" } });
-  assert.equal(base.match_score, round2((20 * 100 + 20 * 50 + 20 * 50) / 60));
-  assert.equal(pri.match_score, round2((25 * 100 + 20 * 50 + 20 * 50) / 65));
-  assert.equal(pri.dimension_coverage, base.dimension_coverage);
-});
-
-test("Priority 不能把 invalid 或缺失维度变有效", () => {
-  const r = run({ body_fit: dim(80, 1), color_fit: dim(80, 1) }, { priority: { dimension: "style_fit", level: "high" } });
-  assert.equal(r.overall_status, "insufficient_coverage");
-  assert.equal(r.weights_used.style_fit, 0);
-});
-
-test("parsePriority：多维度拒绝，非法值拒绝，空值放行", () => {
-  assert.equal(parsePriority(undefined).ok, true);
-  assert.equal(parsePriority([]).ok, true);
-  assert.equal(parsePriority({ dimension: "body_fit", level: "low" }).ok, true);
-  assert.equal(parsePriority([{ dimension: "body_fit", level: "low" }]).ok, true);
-  assert.equal(parsePriority([{ dimension: "body_fit", level: "low" }, { dimension: "style_fit", level: "low" }]).ok, false);
-  assert.equal(parsePriority({ dimension: "hair_fit", level: "low" }).ok, false);
-  assert.equal(parsePriority({ dimension: "body_fit", level: "max" }).ok, false);
-});
-
-// ── 资格 ────────────────────────────────────────────────────────
-test("资格合并所有已计算维度（含 invalid），与覆盖率门槛独立", () => {
-  const r = run({
-    body_fit: dim(80, 1, { eligibility: { purchase: false, recommendation: true, styling: true } }),
-    budget_fit: dim(null, 0, { eligibility: { purchase: true, recommendation: false, styling: true } }),
-  });
-  assert.equal(r.purchase_eligibility, false);
-  assert.equal(r.recommendation_eligibility, false);
-  assert.equal(r.styling_eligibility, true);
-  assert.deepEqual(r.display.independent, ["INSUFFICIENT_COVERAGE", "PURCHASE_INELIGIBLE", "RECOMMENDATION_INELIGIBLE"]);
-});
-
-// ── 解释 ────────────────────────────────────────────────────────
-test("③C 例：覆盖不足 + 购买关闭时，warnings 仍可展示两条规则冲突", () => {
-  const r = run({
-    body_fit: dim(60, 1, { warnings: ["W_BODY_1", "W_BODY_2"], eligibility: { purchase: false, recommendation: true, styling: true } }),
-  });
-  assert.deepEqual(r.display.warnings.map(w => w.code), ["W_BODY_1", "W_BODY_2"]);
-  assert.ok(r.diagnostics.some(d => d.code === "INSUFFICIENT_COVERAGE"));
-  assert.ok(r.diagnostics.some(d => d.code === "PURCHASE_INELIGIBLE"));
-});
-
-test("校验异常排在规则冲突之前；最多 2 条 warnings、3 条 strengths；去重", () => {
-  const r = run({
-    body_fit: dim(80, 1, { strengths: ["S1", "S2"], warnings: ["W1"], unit_validation_error_count: 2 }),
-    style_fit: dim(80, 1, { strengths: ["S2", "S3", "S4"], warnings: ["W2"] }),
-    color_fit: dim(80, 1),
-  });
-  assert.deepEqual(r.display.warnings.map(w => w.code), ["UNIT_VALIDATION_ERROR", "W1"]);
-  assert.deepEqual(r.display.strengths.map(s => s.code), ["S1", "S2", "S3"]);
-  // 完整证据不删除
-  assert.equal(r.warnings.length, 2);
-  assert.equal(r.strengths.length, 5);
-  const uve = r.diagnostics.find(d => d.code === "UNIT_VALIDATION_ERROR")!;
-  assert.equal(uve.source, "system");
-  assert.equal((uve as any).dimension, "body_fit");
-  assert.equal((uve as any).count, 2);
-});
-
-test("规则原因码与系统诊断码来源分开标记", () => {
-  const r = run({ body_fit: dim(80, 1, { strengths: ["BODY_VOLUME_BALANCED"] }) });
-  assert.equal(r.strengths[0].source, "rule");
-  assert.ok(r.diagnostics.every(d => d.source === "system"));
-});
-
-test("adjustments 固定为空数组", () => {
-  assert.deepEqual(run({}).adjustments, []);
-});
-
-// ── 分数等级 ────────────────────────────────────────────────────
-test("89.60 → high_match（按两位小数判断，不按显示取整）", () => {
-  const r = run({ body_fit: dim(89.6, 1), style_fit: dim(89.6, 1), color_fit: dim(89.6, 1) });
-  assert.equal(r.match_score, 89.6);
-  assert.equal(r.score_band!.band, "high_match");
-});
-
-test("selectForDisplay：只有独立诊断时 warnings 为空", () => {
-  const d = selectForDisplay([], [], [{ source: "system", code: "INSUFFICIENT_COVERAGE", scope: "overall", display: "independent" }]);
-  assert.deepEqual(d.warnings, []);
-  assert.deepEqual(d.independent, ["INSUFFICIENT_COVERAGE"]);
-});
-
-function round2(n: number) { return Math.round(n * 100) / 100; }
-function round3(n: number) { return Math.round(n * 1000) / 1000; }
-
-for (const [name, fn] of tests) {
-  try { fn(); passed++; console.log(`  ✓ ${name}`); }
-  catch (e) { console.log(`  ✗ ${name}\n    ${(e as Error).message}`); }
+// 各维度计分结果中，汇总层需要的字段
+export interface DimensionInput {
+  result_id?: string;
+  score: number | null;
+  data_coverage: number;
+  rule_coverage: number | null;
+  confidence: number | null;
+  eligibility: Eligibility;
+  strengths: string[];
+  warnings: string[];
+  unit_validation_error_count: number;
+  engine_version: string;
+  rule_versions: (string | null)[];
 }
-console.log(`\n${passed}/${tests.length} 通过`);
-if (passed !== tests.length) process.exit(1);
+
+export type DimensionState = "valid" | "invalid" | "missing";
+
+// ③C 第十一节：系统诊断码（不写入 matching_reason_codes）
+export type SystemCode =
+  | "INSUFFICIENT_COVERAGE" | "PURCHASE_INELIGIBLE" | "RECOMMENDATION_INELIGIBLE"
+  | "STYLING_INELIGIBLE" | "UNIT_VALIDATION_ERROR";
+
+export type Explanation =
+  | { source: "rule"; code: string; dimension: Dimension }
+  | { source: "system"; code: SystemCode; scope: "overall" | "dimension"; dimension?: Dimension; count?: number; display: "independent" | "warning" };
+
+export interface AggregateInput {
+  dimensions: Partial<Record<Dimension, DimensionInput | null>>;
+  scenario?: Scenario | null;
+  priority?: Priority | null;
+  profile_version: number;
+}
+
+export function aggregate(input: AggregateInput) {
+  const scenario = input.scenario ?? null;
+  const priority = input.priority ?? null;
+
+  const state = {} as Record<Dimension, DimensionState>;
+  for (const d of DIMENSIONS) {
+    const r = input.dimensions[d];
+    if (!r) state[d] = "missing";
+    else if (r.score !== null && Number.isFinite(r.score) && r.data_coverage >= MIN_DIMENSION_DATA_COVERAGE) state[d] = "valid";
+    else state[d] = "invalid";
+  }
+  const valid = DIMENSIONS.filter(d => state[d] === "valid");
+
+  // 门槛只看固定默认权重，不受场景和优先级影响（③C 第四节）
+  const coveragePct = valid.reduce((s, d) => s + DEFAULT_WEIGHT_PCT[d], 0);
+  const sufficient = valid.length >= MIN_VALID_DIMENSIONS && coveragePct >= MIN_DIMENSION_COVERAGE_PCT;
+
+  // 实际贡献权重（③C 第三节）
+  const rawPct = {} as Record<Dimension, number>;
+  for (const d of DIMENSIONS) {
+    rawPct[d] = DEFAULT_WEIGHT_PCT[d]
+      + (scenario ? SCENARIO_ADJUSTMENT_PCT[scenario][d] : 0)
+      + (priority && priority.dimension === d ? PRIORITY_INCREMENT_PCT[priority.level] : 0);
+  }
+  const contrib = {} as Record<Dimension, number>;
+  let contribSum = 0;
+  for (const d of DIMENSIONS) {
+    contrib[d] = state[d] === "valid" ? rawPct[d] * input.dimensions[d]!.data_coverage : 0;
+    contribSum += contrib[d];
+  }
+  const weightsUsed = {} as Record<Dimension, number>;
+  for (const d of DIMENSIONS) weightsUsed[d] = contribSum > 0 ? contrib[d] / contribSum : 0;
+
+  const matchScore = sufficient
+    ? round(valid.reduce((s, d) => s + weightsUsed[d] * input.dimensions[d]!.score!, 0), 2)
+    : null;
+
+  // 总层指标（③C 第六节）
+  let dataCov = 0, ruleNum = 0, ruleDen = 0;
+  for (const d of DIMENSIONS) {
+    const r = input.dimensions[d];
+    if (!r) continue;
+    const wd = (DEFAULT_WEIGHT_PCT[d] / 100) * r.data_coverage;
+    dataCov += wd;
+    if (r.rule_coverage !== null && wd > 0) { ruleNum += wd * r.rule_coverage; ruleDen += wd; }
+  }
+  let confNum = 0, confDen = 0;
+  for (const d of valid) {
+    const c = input.dimensions[d]!.confidence;
+    if (c !== null) { confNum += weightsUsed[d] * c; confDen += weightsUsed[d]; }
+  }
+
+  // 资格：合并所有已计算维度（含 invalid），与覆盖率门槛无关（③C 第八节）
+  const eligibility: Eligibility = { purchase: true, recommendation: true, styling: true };
+  for (const d of DIMENSIONS) {
+    const r = input.dimensions[d];
+    if (!r) continue;
+    eligibility.purchase &&= r.eligibility.purchase;
+    eligibility.recommendation &&= r.eligibility.recommendation;
+    eligibility.styling &&= r.eligibility.styling;
+  }
+
+  // 解释：规则原因码 + 系统诊断码，来源分开标记（③C 第十一节）
+  const strengths: Explanation[] = [];
+  const warnings: Explanation[] = [];
+  const diagnostics: Explanation[] = [];
+  if (!sufficient) diagnostics.push({ source: "system", code: "INSUFFICIENT_COVERAGE", scope: "overall", display: "independent" });
+  if (!eligibility.purchase) diagnostics.push({ source: "system", code: "PURCHASE_INELIGIBLE", scope: "overall", display: "independent" });
+  if (!eligibility.recommendation) diagnostics.push({ source: "system", code: "RECOMMENDATION_INELIGIBLE", scope: "overall", display: "independent" });
+  if (!eligibility.styling) diagnostics.push({ source: "system", code: "STYLING_INELIGIBLE", scope: "overall", display: "independent" });
+
+  // 同类内按维度默认权重从高到低（同权重按维度顺序）
+  const byWeight = [...DIMENSIONS].sort((a, b) => DEFAULT_WEIGHT_PCT[b] - DEFAULT_WEIGHT_PCT[a]);
+  for (const d of byWeight) {
+    const r = input.dimensions[d];
+    if (!r) continue;
+    if (r.unit_validation_error_count > 0) {
+      diagnostics.push({ source: "system", code: "UNIT_VALIDATION_ERROR", scope: "dimension", dimension: d, count: r.unit_validation_error_count, display: "warning" });
+    }
+    for (const c of r.strengths) strengths.push({ source: "rule", code: c, dimension: d });
+    for (const c of r.warnings) warnings.push({ source: "rule", code: c, dimension: d });
+  }
+
+  const dimensions = {} as Record<Dimension, (DimensionInput & { state: DimensionState }) | null>;
+  for (const d of DIMENSIONS) {
+    const r = input.dimensions[d];
+    dimensions[d] = r ? { ...r, state: state[d] } : null;
+  }
+
+  return {
+    engine_version: ENGINE_VERSION,
+    profile_version: input.profile_version,
+    overall_status: sufficient ? "ok" as const : "insufficient_coverage" as const,
+    match_score: matchScore,
+    score_band: scoreBand(matchScore),
+    dimension_coverage: coveragePct / 100,
+    valid_dimensions: valid.length,
+    data_coverage: round(dataCov, 3),
+    rule_coverage: ruleDen > 0 ? round(ruleNum / ruleDen, 3) : null,
+    confidence: confDen > 0 ? round(confNum / confDen, 3) : null,
+    purchase_eligibility: eligibility.purchase,
+    recommendation_eligibility: eligibility.recommendation,
+    styling_eligibility: eligibility.styling,
+    weights_used: Object.fromEntries(DIMENSIONS.map(d => [d, round(weightsUsed[d], 4)])) as Record<Dimension, number>,
+    scenario,
+    scenario_matrix_version: SCENARIO_MATRIX_VERSION,
+    priority,
+    dimensions,
+    strengths,
+    warnings,
+    diagnostics,
+    display: selectForDisplay(strengths, warnings, diagnostics),
+    adjustments: [] as never[],
+  };
+}
+
+// ③C 第十一节：前端最多 3 条 strengths + 2 条 warnings。
+// 独立展示的诊断（覆盖不足、资格关闭）不占 warnings 名额；
+// 其余按"校验异常 → 规则冲突"排序，同 code 去重。
+export function selectForDisplay(strengths: Explanation[], warnings: Explanation[], diagnostics: Explanation[]) {
+  const dedupe = (list: Explanation[]) => {
+    const seen = new Set<string>();
+    return list.filter(e => (seen.has(e.code) ? false : (seen.add(e.code), true)));
+  };
+  const inlineDiagnostics = diagnostics.filter(e => e.source === "system" && e.display === "warning");
+  return {
+    strengths: dedupe(strengths).slice(0, 3),
+    warnings: dedupe([...inlineDiagnostics, ...warnings]).slice(0, 2),
+    independent: diagnostics.filter(e => e.source === "system" && e.display === "independent").map(e => e.code),
+  };
+}
+
+// ── 请求参数校验（③C 第三节：优先级一次最多一个维度）─────────────
+export function parsePriority(raw: unknown): { ok: true; value: Priority | null } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return { ok: true, value: null };
+    if (raw.length > 1) return { ok: false, error: "priority 一次最多指定一个维度" };
+    raw = raw[0];
+  }
+  const p = raw as { dimension?: unknown; level?: unknown };
+  if (typeof p !== "object" || !DIMENSIONS.includes(p.dimension as Dimension)) return { ok: false, error: "priority.dimension 不合法" };
+  if (!(String(p.level) in PRIORITY_INCREMENT_PCT)) return { ok: false, error: "priority.level 只能是 low / medium / high" };
+  return { ok: true, value: { dimension: p.dimension as Dimension, level: p.level as PriorityLevel } };
+}

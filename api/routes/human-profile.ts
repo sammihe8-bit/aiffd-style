@@ -8,6 +8,7 @@ import {
 } from "../../db/schema";
 import { eq, and } from "drizzle-orm";
 import { authenticate, AuthRequest } from "../middleware/auth";
+import { validateStyleScores, validateStyleCodePatch, roundProbability } from "./human-profile-validate";
 
 const router = Router();
 
@@ -119,6 +120,12 @@ router.patch("/me", authenticate, async (req: AuthRequest, res) => {
       return res.status(400).json({ error: "没有提供任何可更新的字段" })
     }
 
+    // 2026-10-02：主型 / 次型只接受 13 型代码，与商品侧 primary_style 同一套（Style Fit 依赖）
+    const styleCodeProblems = validateStyleCodePatch(patch)
+    if (styleCodeProblems.length > 0) {
+      return res.status(400).json({ error: styleCodeProblems[0], details: styleCodeProblems })
+    }
+
     const changes: { fieldName: string; oldValue: string; newValue: string }[] = []
     const updateData: Record<string, unknown> = {}
     for (const key of validKeys) {
@@ -183,6 +190,10 @@ router.get("/me/history", authenticate, async (req: AuthRequest, res) => {
 })
 
 // POST /me/style-scores —— 整体替换 13 型概率分布
+// 2026-10-02 加固：
+//   · 必须一次提交 13 型、代码合法且不重复、主型唯一且概率最高、次型最多一个且为其余最高（01B 第四节）
+//   · 删除旧分布和写入新分布放在同一个事务里，中途失败不会留下半份数据
+//   · 记录 engine_version 与 calculated_at
 const styleScoresSchema = z.object({
   scores: z.array(z.object({
     styleCode: z.string(),
@@ -190,22 +201,30 @@ const styleScoresSchema = z.object({
     isPrimary: z.boolean().optional(),
     isSecondary: z.boolean().optional(),
   })),
+  engineVersion: z.string().min(1).max(50).optional(),
 })
 router.post("/me/style-scores", authenticate, async (req: AuthRequest, res) => {
   try {
-    const { scores } = styleScoresSchema.parse(req.body)
+    const { scores, engineVersion } = styleScoresSchema.parse(req.body)
+    const problems = validateStyleScores(scores)
+    if (problems.length > 0) {
+      return res.status(400).json({ error: "风格概率分布不合法", details: problems })
+    }
     const profile = await getOrCreateProfile(req.user!.id)
+    const calculatedAt = new Date()
 
-    await db.delete(profileStyleScores).where(eq(profileStyleScores.profileId, profile.profileId))
-    for (const s of scores) {
-      await db.insert(profileStyleScores).values({
+    await db.transaction(async (tx) => {
+      await tx.delete(profileStyleScores).where(eq(profileStyleScores.profileId, profile.profileId))
+      await tx.insert(profileStyleScores).values(scores.map(s => ({
         profileId: profile.profileId,
         styleCode: s.styleCode,
-        probability: String(s.probability),
+        probability: roundProbability(s.probability).toFixed(3),
         isPrimary: s.isPrimary ?? false,
         isSecondary: s.isSecondary ?? false,
-      })
-    }
+        engineVersion: engineVersion ?? null,
+        calculatedAt,
+      })))
+    })
     res.json({ message: "风格概率分布已更新", count: scores.length })
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors[0].message })

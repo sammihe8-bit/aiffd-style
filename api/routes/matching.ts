@@ -12,6 +12,7 @@ import { authenticate, AuthRequest } from "../middleware/auth";
 import {
   ENGINE_VERSION, computeDimension, validateRuleSet, isHardConstraint, itemSourceConfidence,
   HUMAN_SOURCE_CONFIDENCE, HUMAN_NO_RECORD_CONFIDENCE, ITEM_NO_RECORD_CONFIDENCE, EngineNumericError,
+  channelAppliesTo,
 } from "./matching-core";
 import { aggregate, parsePriority, SCENARIOS, Dimension, DimensionInput } from "./matching-aggregate";
 
@@ -20,8 +21,9 @@ import { aggregate, parsePriority, SCENARIOS, Dimension, DimensionInput } from "
 // 计分逻辑全部在 matching-core.ts（纯函数，可离线测试），这里只负责
 // 读数据库、调用计分核心、保存 matching_results、返回结果。
 //
-// 以后新增 Face / Style / Color 等通道：主要是往 matching_rules 加数据，
-// 再在 matching-core.ts 的 HUMAN_FIELDS / ITEM_FIELDS 注册新字段。
+// 新增通道：往 matching_rules 加数据，在 matching-core.ts 的 HUMAN_FIELDS / ITEM_FIELDS
+// 注册新字段，在下面的 SUPPORTED_CHANNELS 加通道名；需要限定品类时在 CHANNEL_CATEGORY_SCOPE 登记。
+// 已上线：body_fit（2026-09）、face_fit（2026-10-01）。
 // ══════════════════════════════════════════════════════════════════
 
 export { ENGINE_VERSION };
@@ -88,6 +90,12 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
     if (vr.length === 0 || vr[0].itemId !== itemId) return { error: "变体不存在或不属于该商品", status: 404 as const };
     variant = vr[0];
   }
+
+  // 品类门控（03A Face Fit 第三节）：范围外不计分、不写 matching_results
+  if (!channelAppliesTo(channel, item.category)) {
+    return { error: `商品品类 ${item.category} 不在 ${channel} 的适用范围内`, status: 422 as const, code: "CATEGORY_OUT_OF_SCOPE" as const };
+  }
+
   const material = await loadMaterial(itemId, variantId);
 
   const { valid: rules, errors: ruleErrors, activeCount } = await loadValidatedRules(channel);
@@ -180,7 +188,7 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
 // 路由
 // ══════════════════════════════════════════════════════════════════
 
-const SUPPORTED_CHANNELS = ["body_fit"] as const;
+const SUPPORTED_CHANNELS = ["body_fit", "face_fit"] as const;
 
 const scoreSchema = z.object({
   itemId: z.string().min(1).max(30),
@@ -211,7 +219,8 @@ router.post("/score", authenticate, async (req: AuthRequest, res) => {
 });
 
 // POST /match —— 当前登录用户 × 指定商品，计算所有已上线维度并按 ③C 汇总
-// 目前只有 body_fit 上线，所以总分一定是 insufficient_coverage（③C 第五节），这是预期行为
+// 目前只有 body_fit + face_fit 上线（默认权重 30%，有效维度最多 2 个），
+// 总分一定是 insufficient_coverage（③C 第五节），这是预期行为
 const matchSchema = z.object({
   itemId: z.string().min(1).max(30),
   variantId: z.string().min(1).max(30).optional(),
@@ -229,11 +238,14 @@ router.post("/match", authenticate, async (req: AuthRequest, res) => {
     if (profiles.length === 0) return res.status(404).json({ error: "还没有风格档案，请先完成测试" });
 
     const dimensions: Partial<Record<Dimension, DimensionInput>> = {};
-    const skipped: { dimension: string; status: number; error: string }[] = [];
+    const skipped: { dimension: string; status: number; error: string; code?: string }[] = [];
     for (const channel of SUPPORTED_CHANNELS) {
       const r = await scoreChannel(channel, profiles[0], itemId, variantId ?? null);
       if (r.status === 404) return res.status(404).json({ error: r.error });
-      if (r.status !== 200) { skipped.push({ dimension: channel, status: r.status, error: r.error }); continue; }
+      if (r.status !== 200) {
+        skipped.push({ dimension: channel, status: r.status, error: r.error, ...("code" in r ? { code: r.code } : {}) });
+        continue;
+      }
       dimensions[channel as Dimension] = r.aggregateInput;
     }
 

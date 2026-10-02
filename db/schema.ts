@@ -236,6 +236,9 @@ export const profileStyleScores = mysqlTable("profile_style_scores", {
   probability: decimal("probability", { precision: 4, scale: 3 }).notNull(),
   isPrimary: boolean("is_primary").default(false).notNull(),
   isSecondary: boolean("is_secondary").default(false).notNull(),
+  // 2026-10-02 新增（01B 第四节建议字段）：哪个算法版本、什么时候算出的这组分布
+  engineVersion: varchar("engine_version", { length: 50 }),
+  calculatedAt: timestamp("calculated_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -335,7 +338,8 @@ const FIELD_SOURCE_METHODS = [
   "ai_image_analysis", "ai_text_analysis", "system_inference",
 ] as const;
 
-const STYLE_CODES = [
+// 13 型风格代码：商品侧 primary_style、人侧 primary_style / secondary_style、profile_style_scores.style_code 共用
+export const STYLE_CODES = [
   "R", "TR", "SG", "G", "FG", "SC", "C", "DC", "SN", "N", "FN", "SD", "D",
 ] as const;
 

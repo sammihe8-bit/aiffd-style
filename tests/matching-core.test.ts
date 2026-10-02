@@ -1,8 +1,14 @@
 // 运行：npm run test:matching
-// 离线测试 matching-core.ts，不连数据库。覆盖 ③C 第十三节两项前置修复的验收用例。
+// 离线测试 matching-core.ts，不连数据库。覆盖 ③C 第十三节两项前置修复的验收用例，
+// 以及 Face Fit V1.0（2026-10-01）的字段注册、规则数据、品类门控和测试账号预期值。
 import assert from "node:assert/strict";
 import { MatchingRule } from "../db/schema";
-import { computeDimension, validateRule, validateRuleSet, readHumanValue, HUMAN_FIELDS, EngineNumericError } from "../api/routes/matching-core";
+import {
+  computeDimension, validateRule, validateRuleSet, readHumanValue, HUMAN_FIELDS, ITEM_FIELDS, EngineNumericError,
+  channelAppliesTo, CHANNEL_CATEGORY_SCOPE,
+} from "../api/routes/matching-core";
+import { aggregate } from "../api/routes/matching-aggregate";
+import { faceFitRules, FACE_FIT_REASONS } from "./face-fit-rules";
 
 let passed = 0;
 const tests: [string, () => Promise<void> | void][] = [];
@@ -243,6 +249,175 @@ test("日志不含用户原始值", async () => {
   assert.ok(logs.length > 0);
   assert.ok(!text.includes("细") && !text.includes("匀"), "日志里不应出现档案原始值");
   assert.ok(text.includes("single_select_multiple_values"));
+});
+
+// ── Face Fit V1.0（03A Face Fit 定稿版）────────────────────────────
+const FACE_HUMAN = [
+  "cheek_contour", "cheekbone_shape", "chin_shape", "nose_shape", "eye_shape", "eye_size",
+  "nose_size", "mouth_fullness", "chin_length", "cheek_fullness", "cheekbone_prominence", "nose_projection",
+];
+
+// 测试账号 AIFFD_PROFILE_000001 的面部字段（2026-10-01 TiDB 查询结果）
+const TEST_FACE = {
+  cheekContour: "angular", cheekboneShape: "balanced", chinShape: "square", noseShape: "balanced", eyeShape: "round",
+  eyeSize: "small", noseSize: "medium", mouthFullness: "medium", chinLength: "short", cheekFullness: "moderate",
+  cheekboneProminence: "prominent", noseProjection: "medium",
+};
+// 测试商品 AIFFD_ITEM_000002（tops）
+const TEST_ITEM = { lineQuality: null as string | null, neckline: "crew", visualVolume: "small", structureLevel: "soft" };
+const faceReasonDir = new Map(FACE_FIT_REASONS.map(([c, , d]) => [c, d as string]));
+
+async function runFace(item: Record<string, unknown>, profile: Record<string, unknown> = TEST_FACE) {
+  const { valid } = validateRuleSet(faceFitRules());
+  return computeDimension({
+    channel: "face_fit", rules: valid, reasonDir: faceReasonDir, profile, item, material: null,
+    humanConfidence: async () => 0.8, itemConfidence: async () => 0.8, log: () => {},
+  });
+}
+
+test("Face Fit：12 个人侧字段注册，值域与数据库枚举一致", () => {
+  const schemaKeys: Record<string, string> = {
+    cheek_contour: "cheekContour", cheekbone_shape: "cheekboneShape", chin_shape: "chinShape", nose_shape: "noseShape",
+    eye_shape: "eyeShape", eye_size: "eyeSize", nose_size: "noseSize", mouth_fullness: "mouthFullness",
+    chin_length: "chinLength", cheek_fullness: "cheekFullness", cheekbone_prominence: "cheekboneProminence", nose_projection: "noseProjection",
+  };
+  for (const f of FACE_HUMAN) {
+    assert.ok(HUMAN_FIELDS[f], `未注册 ${f}`);
+    assert.equal(HUMAN_FIELDS[f].key, schemaKeys[f]);
+    assert.deepEqual([...HUMAN_FIELDS[f].values], [...(humanStyleProfiles as any)[schemaKeys[f]].enumValues]);
+  }
+  assert.ok(!HUMAN_FIELDS.jawline && !HUMAN_FIELDS.face_shape && !HUMAN_FIELDS.face_line, "V1.0 不注册未采集的汇总字段");
+});
+
+test("Face Fit：line_quality 注册；neckline 值域去掉 other", () => {
+  assert.deepEqual([...ITEM_FIELDS.line_quality.values], [...fashionItems.lineQuality.enumValues]);
+  assert.ok(!ITEM_FIELDS.neckline.values.includes("other"));
+  assert.equal(ITEM_FIELDS.neckline.values.length, fashionItems.neckline.enumValues.length - 1);
+});
+
+test("Face Fit：123 条规则全部合法，12 个计分单元，4 个子维度权重一致", () => {
+  const rules = faceFitRules();
+  assert.equal(rules.length, 123);
+  assert.equal(new Set(rules.map(r => r.ruleId)).size, 123, "rule_id 不能重复");
+  const { valid, errors } = validateRuleSet(rules);
+  assert.deepEqual(errors, []);
+  assert.equal(valid.length, 123);
+  assert.equal(new Set(valid.map(r => `${r.subDimension}|${r.humanField}|${r.itemField}`)).size, 12);
+  const w: Record<string, Set<string>> = {};
+  for (const r of valid) (w[r.subDimension] ??= new Set()).add(String(r.ruleWeight));
+  assert.deepEqual(Object.fromEntries(Object.entries(w).map(([k, v]) => [k, [...v]])), {
+    facial_line_echo: ["4.0"], feature_scale_echo: ["2.5"], contour_depth_echo: ["1.5"], neckline_proportion: ["2.0"],
+  });
+});
+
+test("Face Fit：穷举——前三个子维度每个组合恰好一条规则，领型最多一条", () => {
+  const rules = faceFitRules();
+  const units = new Map<string, MatchingRule[]>();
+  for (const r of rules) {
+    const k = `${r.subDimension}|${r.humanField}|${r.itemField}`;
+    units.set(k, [...(units.get(k) ?? []), r]);
+  }
+  for (const [k, rs] of units) {
+    const [sub, hf, itf] = k.split("|");
+    for (const hv of HUMAN_FIELDS[hf].values) {
+      if (hv === "uncertain") continue;
+      for (const iv of ITEM_FIELDS[itf].values) {
+        const n = rs.filter(r => (r.humanValue as string[]).includes(hv) && (r.itemValue as string[]).includes(iv)).length;
+        if (sub === "neckline_proportion") assert.ok(n <= 1, `${k} ${hv}×${iv} 命中 ${n} 条`);
+        else assert.equal(n, 1, `${k} ${hv}×${iv} 命中 ${n} 条`);
+      }
+    }
+  }
+});
+
+test("Face Fit：原因码齐全，positive → strength、penalty → warning、neutral 用 FF_NEUTRAL 占位", () => {
+  const dir = new Map(FACE_FIT_REASONS.map(([c, , d]) => [c, d]));
+  assert.equal(FACE_FIT_REASONS.length, 16);
+  assert.ok(!dir.has("FF_NEUTRAL"), "FF_NEUTRAL 只是占位，不进入原因码表");
+  for (const r of faceFitRules()) {
+    if (r.matchType === "neutral") { assert.equal(r.reasonCode, "FF_NEUTRAL", r.ruleId); continue; }
+    assert.equal(dir.get(r.reasonCode!), r.matchType === "positive" ? "strength" : "warning", r.ruleId);
+  }
+});
+
+test("Face Fit：测试账号 × 测试商品（line_quality 为空）→ 56.46 / 0.6 / 0.667", async () => {
+  const { dimensionResult: d } = await runFace(TEST_ITEM);
+  assert.equal(d.score, 56.46);
+  assert.equal(d.data_coverage, 0.6);
+  assert.equal(d.rule_coverage, 0.667);
+  assert.equal(d.confidence, 0.8);
+  assert.deepEqual(d.strengths, ["FF_SCALE_ECHO"]);
+  assert.deepEqual(d.warnings, ["FF_STRUCTURE_TOO_WEAK"]);
+  assert.equal(d.rules_applied, 5);
+  assert.equal(d.default_neutral_units, 2);
+  assert.equal(d.units_skipped, 5);
+  noNaN(d);
+});
+
+test("Face Fit：补录 line_quality = soft_curved → 60.28 / 1.0 / 0.8", async () => {
+  const { dimensionResult: d, detail } = await runFace({ ...TEST_ITEM, lineQuality: "soft_curved" });
+  assert.equal(d.score, 60.28);
+  assert.equal(d.data_coverage, 1);
+  assert.equal(d.rule_coverage, 0.8);
+  assert.equal(d.confidence, 0.8);
+  assert.deepEqual([...d.strengths].sort(), ["FF_BALANCED_ECHO", "FF_CURVE_ECHO", "FF_SCALE_ECHO"]);
+  assert.deepEqual([...d.warnings].sort(), ["FF_LINE_TOO_SOFT", "FF_STRUCTURE_TOO_WEAK"]);
+  const hit = Object.fromEntries(detail.units.filter((u: any) => u.rule_id).map((u: any) => [u.human_field, u.rule_id]));
+  assert.deepEqual(hit, {
+    cheek_contour: "FF_013", cheekbone_shape: "FF_021", chin_shape: "FF_037", nose_shape: "FF_045", eye_shape: "FF_053",
+    eye_size: "FF_067", nose_size: "FF_083", mouth_fullness: "FF_094", cheekbone_prominence: "FF_107", nose_projection: "FF_112",
+  });
+});
+
+test("Face Fit：neckline = other 按缺失处理，不按默认中性计分", async () => {
+  const { detail } = await runFace({ ...TEST_ITEM, neckline: "other" });
+  assert.deepEqual(statusOf(detail, "chin_length"), ["not_applicable"]);
+  assert.deepEqual(statusOf(detail, "cheek_fullness"), ["not_applicable"]);
+});
+
+test("Face Fit：人侧 uncertain / 空值 → not_applicable；全部缺失时 score 为 null", async () => {
+  const { detail } = await runFace(TEST_ITEM, { ...TEST_FACE, eyeSize: "uncertain", noseSize: null });
+  assert.deepEqual(statusOf(detail, "eye_size"), ["not_applicable"]);
+  assert.deepEqual(statusOf(detail, "nose_size"), ["not_applicable"]);
+  const { dimensionResult: d } = await runFace(TEST_ITEM, {});
+  assert.equal(d.score, null);
+  assert.equal(d.data_coverage, 0);
+  noNaN(d);
+});
+
+test("品类门控：face_fit 只对 tops / outerwear / dresses / one_piece；body_fit 不受限", () => {
+  for (const c of ["tops", "outerwear", "dresses", "one_piece"]) assert.equal(channelAppliesTo("face_fit", c), true, c);
+  for (const c of ["bottoms", "shoes", "bags", "accessories", null, undefined, "", "toString"]) {
+    assert.equal(channelAppliesTo("face_fit", c), false, String(c));
+  }
+  for (const c of ["tops", "shoes", "bags", null]) assert.equal(channelAppliesTo("body_fit", c), true, String(c));
+  for (const ch of ["toString", "__proto__", "constructor"]) assert.equal(channelAppliesTo(ch, "shoes"), true, ch);
+  assert.deepEqual(Object.keys(CHANNEL_CATEGORY_SCOPE), ["face_fit"]);
+});
+
+test("汇总：只有 Body + Face 有效 → insufficient_coverage、dimension_coverage 0.3、总分 null", async () => {
+  const face = (await runFace({ ...TEST_ITEM, lineQuality: "soft_curved" })).dimensionResult;
+  const asInput = (d: any, dc: number) => ({
+    score: d.score, data_coverage: dc, rule_coverage: d.rule_coverage, confidence: d.confidence,
+    eligibility: d.eligibility, strengths: d.strengths, warnings: d.warnings,
+    unit_validation_error_count: 0, engine_version: "matching_v1.0", rule_versions: d.rule_versions,
+  });
+  const body = { score: 78.33, data_coverage: 0.6, rule_coverage: 0.611, confidence: 0.8,
+    eligibility: { purchase: true, recommendation: true, styling: true }, strengths: [], warnings: [],
+    unit_validation_error_count: 0, engine_version: "matching_v1.0", rule_versions: ["v1.0", "v1.1"] };
+  const out = aggregate({ dimensions: { body_fit: body, face_fit: asInput(face, 1) }, profile_version: 7 });
+  assert.equal(out.overall_status, "insufficient_coverage");
+  assert.equal(out.match_score, null);
+  assert.equal(out.valid_dimensions, 2);
+  assert.equal(out.dimension_coverage, 0.3);
+  assert.equal(out.data_coverage, 0.22);
+  // weights_used 输出保留 4 位小数：12 / 22、10 / 22
+  assert.equal(out.weights_used.body_fit, 0.5455);
+  assert.equal(out.weights_used.face_fit, 0.4545);
+  // Face Fit 覆盖率低于 0.30 → invalid，dimension_coverage 回到 0.2
+  const low = aggregate({ dimensions: { body_fit: body, face_fit: asInput(face, 0.15) }, profile_version: 7 });
+  assert.equal(low.valid_dimensions, 1);
+  assert.equal(low.dimension_coverage, 0.2);
 });
 
 (async () => {

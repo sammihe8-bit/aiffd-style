@@ -70,6 +70,22 @@ export const HUMAN_FIELDS: Record<string, HumanFieldDef> = {
   body_shape: { key: "bodyShape", values: humanStyleProfiles.bodyShape.enumValues },
   limb_length: { key: "limbLength", values: humanStyleProfiles.limbLength.enumValues },
   flesh_texture: { key: "fleshTexture", values: humanStyleProfiles.fleshTexture.enumValues },
+
+  // ── Face Fit（03A Face Fit V1.0，2026-10-01）──
+  // 只注册前端真实双写的原始五官字段。face_shape / face_sharpness_* / face_line / jawline
+  // 前端从未写入，V1.0 不使用。uncertain 由 UNCERTAIN_VALUES 统一视为缺失。
+  cheek_contour: { key: "cheekContour", values: humanStyleProfiles.cheekContour.enumValues },
+  cheekbone_shape: { key: "cheekboneShape", values: humanStyleProfiles.cheekboneShape.enumValues },
+  chin_shape: { key: "chinShape", values: humanStyleProfiles.chinShape.enumValues },
+  nose_shape: { key: "noseShape", values: humanStyleProfiles.noseShape.enumValues },
+  eye_shape: { key: "eyeShape", values: humanStyleProfiles.eyeShape.enumValues },
+  eye_size: { key: "eyeSize", values: humanStyleProfiles.eyeSize.enumValues },
+  nose_size: { key: "noseSize", values: humanStyleProfiles.noseSize.enumValues },
+  mouth_fullness: { key: "mouthFullness", values: humanStyleProfiles.mouthFullness.enumValues },
+  chin_length: { key: "chinLength", values: humanStyleProfiles.chinLength.enumValues },
+  cheek_fullness: { key: "cheekFullness", values: humanStyleProfiles.cheekFullness.enumValues },
+  cheekbone_prominence: { key: "cheekboneProminence", values: humanStyleProfiles.cheekboneProminence.enumValues },
+  nose_projection: { key: "noseProjection", values: humanStyleProfiles.noseProjection.enumValues },
 };
 
 type ItemSource = "item" | "material";
@@ -81,7 +97,26 @@ export const ITEM_FIELDS: Record<string, { source: ItemSource; key: string; valu
   garment_length: { source: "item", key: "garmentLength", values: fashionItems.garmentLength.enumValues },
   structure_level: { source: "item", key: "structureLevel", values: fashionItems.structureLevel.enumValues },
   drape_level: { source: "material", key: "drapeLevel", values: fashionItemMaterialAttributes.drapeLevel.enumValues },
+
+  // ── Face Fit ──
+  line_quality: { source: "item", key: "lineQuality", values: fashionItems.lineQuality.enumValues },
+  // neckline = other 不进入注册值域：读取时按缺失处理（not_applicable），规则里也不能引用它
+  neckline: { source: "item", key: "neckline", values: fashionItems.neckline.enumValues.filter(v => v !== "other") },
 };
+
+// ── 品类适用范围（03A Face Fit 第三节）────────────────────────────────
+// 未列出的通道不限品类（body_fit 维持原行为）。列出的通道只对范围内品类计算，
+// 范围外由路由层跳过：/score 返回 422 CATEGORY_OUT_OF_SCOPE，/match 列入 skipped_dimensions。
+// Face Fit 只看穿在脸部附近的品类；accessories 待 02A 定下配饰子类枚举后再评估。
+export const CHANNEL_CATEGORY_SCOPE: Record<string, readonly string[]> = {
+  face_fit: ["tops", "outerwear", "dresses", "one_piece"],
+};
+
+export function channelAppliesTo(channel: string, category: unknown): boolean {
+  const scope = Object.prototype.hasOwnProperty.call(CHANNEL_CATEGORY_SCOPE, channel) ? CHANNEL_CATEGORY_SCOPE[channel] : undefined;
+  if (!scope) return true;
+  return typeof category === "string" && scope.includes(category);
+}
 
 // "不确定"一律视为缺失（③B 第七节）
 const UNCERTAIN_VALUES = new Set(["不确定", "uncertain"]);

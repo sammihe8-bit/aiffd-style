@@ -5,9 +5,11 @@ import {
   fashionItems, fashionItemVariants, fashionItemFieldSources,
   fashionItemStyleFeatures, fashionItemStyleScores, fashionItemStyleTags,
   fashionItemMaterialAttributes, fashionVariantColorAttributes, fashionVariantColorIdentity,
+  STYLE_CODES, STYLE_SOURCE_METHODS,
 } from "../../db/schema";
 import { eq, and, isNull, desc } from "drizzle-orm";
 import { authenticate, requireRole, AuthRequest } from "../middleware/auth";
+import { validateItemStyleScores } from "./matching-style";
 
 const router = Router();
 
@@ -30,8 +32,7 @@ const FIELD_SOURCE_METHODS = [
   "brand_source", "manual_operator", "stylist",
   "ai_image_analysis", "ai_text_analysis", "system_inference",
 ] as const;
-const STYLE_SOURCE_METHODS = ["rule_engine", "ai_image_analysis", "ai_text_analysis", "stylist"] as const;
-const STYLE_CODES = ["R", "TR", "SG", "G", "FG", "SC", "C", "DC", "SN", "N", "FN", "SD", "D"] as const;
+// STYLE_CODES、STYLE_SOURCE_METHODS 改为从 db/schema.ts 引用（2026-10-03），不再在这里重复定义
 
 const ITEM_PATCHABLE_FIELDS = [
   "brandName", "itemName", "sourceCategory", "category", "subcategory",
@@ -406,7 +407,8 @@ router.post("/color-identity", authenticate, requireRole("admin"), async (req: A
   }
 });
 
-// POST /items/:itemId/style-scores —— 整体替换 13 型适配概率分布
+// POST /items/:itemId/style-scores —— 整体替换商品对各型的适配度（03A Part C：各型独立，0~1，不要求 13 型齐全）
+// 2026-10-03：写入前做 validateItemStyleScores 校验；删除 + 插入 + 回写主表放进同一个事务
 const styleScoresSchema = z.object({
   variantId: z.string().optional(),
   scores: z.array(z.object({
@@ -423,27 +425,31 @@ router.post("/items/:itemId/style-scores", authenticate, requireRole("admin"), a
   try {
     const { itemId } = req.params;
     const { variantId, scores } = styleScoresSchema.parse(req.body);
+    const problems = validateItemStyleScores(scores);
+    if (problems.length > 0) return res.status(400).json({ error: "风格分校验未通过", details: problems });
 
     const variantCond = variantId ? eq(fashionItemStyleScores.variantId, variantId) : isNull(fashionItemStyleScores.variantId);
-    await db.delete(fashionItemStyleScores).where(and(eq(fashionItemStyleScores.itemId, itemId), variantCond));
-    for (const s of scores) {
-      await db.insert(fashionItemStyleScores).values({
-        itemId, variantId: variantId ?? null, styleCode: s.styleCode, score: String(s.score),
-        isPrimary: s.isPrimary ?? false, isSecondary: s.isSecondary ?? false,
-        confidence: s.confidence !== undefined ? String(s.confidence) : null,
-        sourceMethod: s.sourceMethod, engineVersion: s.engineVersion,
-      });
-    }
+    await db.transaction(async (tx) => {
+      await tx.delete(fashionItemStyleScores).where(and(eq(fashionItemStyleScores.itemId, itemId), variantCond));
+      for (const s of scores) {
+        await tx.insert(fashionItemStyleScores).values({
+          itemId, variantId: variantId ?? null, styleCode: s.styleCode, score: String(s.score),
+          isPrimary: s.isPrimary ?? false, isSecondary: s.isSecondary ?? false,
+          confidence: s.confidence !== undefined ? String(s.confidence) : null,
+          sourceMethod: s.sourceMethod, engineVersion: s.engineVersion,
+        });
+      }
 
-    if (!variantId) {
-      const primary = scores.find(s => s.isPrimary);
-      const secondary = scores.find(s => s.isSecondary);
-      await db.update(fashionItems).set({
-        primaryStyle: primary?.styleCode as any,
-        secondaryStyle: secondary?.styleCode as any,
-        styleConfidence: primary?.confidence !== undefined ? String(primary.confidence) : null,
-      }).where(eq(fashionItems.itemId, itemId));
-    }
+      if (!variantId) {
+        const primary = scores.find(s => s.isPrimary);
+        const secondary = scores.find(s => s.isSecondary);
+        await tx.update(fashionItems).set({
+          primaryStyle: primary?.styleCode as any,
+          secondaryStyle: secondary?.styleCode as any,
+          styleConfidence: primary?.confidence !== undefined ? String(primary.confidence) : null,
+        }).where(eq(fashionItems.itemId, itemId));
+      }
+    });
 
     res.json({ message: "风格概率分布已更新", count: scores.length });
   } catch (error) {

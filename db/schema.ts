@@ -343,7 +343,8 @@ export const STYLE_CODES = [
   "R", "TR", "SG", "G", "FG", "SC", "C", "DC", "SN", "N", "FN", "SD", "D",
 ] as const;
 
-const STYLE_SOURCE_METHODS = ["rule_engine", "ai_image_analysis", "ai_text_analysis", "stylist"] as const;
+// 2026-10-03：加 manual_operator（人工录入），与字段溯源表一致；fashion-item.ts 直接引用这里的定义
+export const STYLE_SOURCE_METHODS = ["rule_engine", "ai_image_analysis", "ai_text_analysis", "stylist", "manual_operator"] as const;
 
 export const fashionItems = mysqlTable("fashion_items", {
   id: int("id").primaryKey().autoincrement(),

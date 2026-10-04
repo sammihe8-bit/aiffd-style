@@ -6,6 +6,7 @@ import {
   humanStyleProfiles, profileFieldChangeLog,
   fashionItems, fashionItemVariants, fashionItemFieldSources, fashionItemMaterialAttributes,
   matchingRules, matchingReasonCodes, matchingResults,
+  profileStyleScores, fashionItemStyleScores,
 } from "../../db/schema";
 import { eq, and, desc, isNull } from "drizzle-orm";
 import { authenticate, AuthRequest } from "../middleware/auth";
@@ -15,6 +16,7 @@ import {
   channelAppliesTo,
 } from "./matching-core";
 import { aggregate, parsePriority, SCENARIOS, Dimension, DimensionInput } from "./matching-aggregate";
+import { computeStyleFit, STYLE_FIT_CHANNEL, STYLE_FIT_RULE_VERSION, STYLE_FIT_REASONS } from "./matching-style";
 
 // ══════════════════════════════════════════════════════════════════
 // AIFFD Matching Engine V1.0 —— 路由与数据读取
@@ -23,7 +25,8 @@ import { aggregate, parsePriority, SCENARIOS, Dimension, DimensionInput } from "
 //
 // 新增通道：往 matching_rules 加数据，在 matching-core.ts 的 HUMAN_FIELDS / ITEM_FIELDS
 // 注册新字段，在下面的 SUPPORTED_CHANNELS 加通道名；需要限定品类时在 CHANNEL_CATEGORY_SCOPE 登记。
-// 已上线：body_fit（2026-09）、face_fit（2026-10-01）。
+// 已上线：body_fit（2026-09）、face_fit（2026-10-01）、style_fit（2026-10-03）。
+// style_fit 不走规则表，计分在 matching-style.ts（03A Part C）。
 // ══════════════════════════════════════════════════════════════════
 
 export { ENGINE_VERSION };
@@ -65,6 +68,18 @@ async function loadItemSources(itemId: string, variantId: string | null) {
   return (field: string) => variantLevel.get(field) ?? itemLevel.get(field) ?? null;
 }
 
+// 商品风格分（03A Part C 第二节）：变体不继承商品风格且有自己的行时用变体的行，否则用商品级行，两者不混用
+async function loadItemStyleScores(itemId: string, variant: typeof fashionItemVariants.$inferSelect | null) {
+  if (variant && variant.inheritsItemStyle === false) {
+    const v = await db.select().from(fashionItemStyleScores)
+      .where(and(eq(fashionItemStyleScores.itemId, itemId), eq(fashionItemStyleScores.variantId, variant.variantId)));
+    if (v.length > 0) return { rows: v, level: "variant" as const };
+  }
+  const i = await db.select().from(fashionItemStyleScores)
+    .where(and(eq(fashionItemStyleScores.itemId, itemId), isNull(fashionItemStyleScores.variantId)));
+  return { rows: i, level: "item" as const };
+}
+
 async function loadMaterial(itemId: string, variantId: string | null) {
   if (variantId) {
     const v = await db.select().from(fashionItemMaterialAttributes)
@@ -96,42 +111,73 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
     return { error: `商品品类 ${item.category} 不在 ${channel} 的适用范围内`, status: 422 as const, code: "CATEGORY_OUT_OF_SCOPE" as const };
   }
 
-  const material = await loadMaterial(itemId, variantId);
-
-  const { valid: rules, errors: ruleErrors, activeCount } = await loadValidatedRules(channel);
-  if (rules.length === 0) return { error: `通道 ${channel} 没有可用的有效规则`, status: 422 as const, ruleErrors };
-
   const reasonRows = await db.select().from(matchingReasonCodes);
   const reasonDir = new Map(reasonRows.map(r => [r.reasonCode, r.outputDirection as string]));
+  const humanSources = await loadHumanSources(profile.profileId);
 
-  const [humanSources, itemSourceOf] = await Promise.all([
-    loadHumanSources(profile.profileId),
-    loadItemSources(itemId, variantId),
-  ]);
+  let dimensionResult: any;
+  let exact: { data_coverage: number };
+  let detail: Record<string, unknown>;
+  let unitValidationErrorCount: number;
 
-  const { dimensionResult, detail: coreDetail, exact } = await computeDimension({
-    channel, rules, reasonDir,
-    profile: profile as unknown as Record<string, unknown>,
-    item: item as unknown as Record<string, unknown>,
-    material: material as unknown as Record<string, unknown> | null,
-    humanConfidence: async (field) => {
-      const src = humanSources.get(field);
-      return src ? (HUMAN_SOURCE_CONFIDENCE[src] ?? HUMAN_NO_RECORD_CONFIDENCE) : HUMAN_NO_RECORD_CONFIDENCE;
-    },
-    itemConfidence: async (field) => {
-      const src = itemSourceOf(field);
-      return src ? itemSourceConfidence(src.sourceMethod, src.verifiedStatus) : ITEM_NO_RECORD_CONFIDENCE;
-    },
-  });
+  if (channel === STYLE_FIT_CHANNEL) {
+    // ── Style Fit（03A Part C）：人侧 13 型概率 × 商品各型适配度 ──
+    const humanRows = await db.select().from(profileStyleScores)
+      .where(eq(profileStyleScores.profileId, profile.profileId));
+    const { rows: itemRows, level } = await loadItemStyleScores(itemId, variant);
+    const src = humanSources.get("primary_style");
+    const humanConfidence = src ? (HUMAN_SOURCE_CONFIDENCE[src] ?? HUMAN_NO_RECORD_CONFIDENCE) : HUMAN_NO_RECORD_CONFIDENCE;
 
-  const detail = {
-    ...coreDetail,
-    rule_validation_errors: ruleErrors,
-    rules_active: activeCount,
-    rules_valid: rules.length,
-    variant_updated_at: variant?.updatedAt ?? null,
-    material_row: material ? (material.variantId ? "variant" : "item") : null,
-  };
+    const r = computeStyleFit({
+      humanRows: humanRows.map(h => ({
+        styleCode: h.styleCode, probability: h.probability,
+        isPrimary: h.isPrimary, isSecondary: h.isSecondary, engineVersion: h.engineVersion,
+      })),
+      itemRows: itemRows.map(x => ({
+        styleCode: x.styleCode, score: x.score, confidence: x.confidence,
+        sourceMethod: x.sourceMethod, verifiedStatus: x.verifiedStatus, isPrimary: x.isPrimary,
+      })),
+      humanConfidence, reasonDir,
+    });
+    dimensionResult = r.dimensionResult;
+    exact = r.exact;
+    unitValidationErrorCount = r.detail.unit_validation_errors.length;
+    detail = { ...r.detail, item_style_rows_level: level, variant_updated_at: variant?.updatedAt ?? null };
+  } else {
+    // ── 规则表维度（body_fit / face_fit）──
+    const material = await loadMaterial(itemId, variantId);
+
+    const { valid: rules, errors: ruleErrors, activeCount } = await loadValidatedRules(channel);
+    if (rules.length === 0) return { error: `通道 ${channel} 没有可用的有效规则`, status: 422 as const, ruleErrors };
+
+    const itemSourceOf = await loadItemSources(itemId, variantId);
+
+    const r = await computeDimension({
+      channel, rules, reasonDir,
+      profile: profile as unknown as Record<string, unknown>,
+      item: item as unknown as Record<string, unknown>,
+      material: material as unknown as Record<string, unknown> | null,
+      humanConfidence: async (field) => {
+        const src = humanSources.get(field);
+        return src ? (HUMAN_SOURCE_CONFIDENCE[src] ?? HUMAN_NO_RECORD_CONFIDENCE) : HUMAN_NO_RECORD_CONFIDENCE;
+      },
+      itemConfidence: async (field) => {
+        const src = itemSourceOf(field);
+        return src ? itemSourceConfidence(src.sourceMethod, src.verifiedStatus) : ITEM_NO_RECORD_CONFIDENCE;
+      },
+    });
+    dimensionResult = r.dimensionResult;
+    exact = r.exact;
+    unitValidationErrorCount = r.detail.unit_validation_errors.length;
+    detail = {
+      ...r.detail,
+      rule_validation_errors: ruleErrors,
+      rules_active: activeCount,
+      rules_valid: rules.length,
+      variant_updated_at: variant?.updatedAt ?? null,
+      material_row: material ? (material.variantId ? "variant" : "item") : null,
+    };
+  }
 
   // 保存结果；eligibility 与硬约束明细存在 result_detail_json 里，无需迁移
   const resultId = `MR_${randomUUID()}`;
@@ -162,7 +208,7 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
     eligibility: dimensionResult.eligibility,
     strengths: dimensionResult.strengths,
     warnings: dimensionResult.warnings,
-    unit_validation_error_count: coreDetail.unit_validation_errors.length,
+    unit_validation_error_count: unitValidationErrorCount,
     engine_version: ENGINE_VERSION,
     rule_versions: dimensionResult.rule_versions,
   };
@@ -188,7 +234,7 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
 // 路由
 // ══════════════════════════════════════════════════════════════════
 
-const SUPPORTED_CHANNELS = ["body_fit", "face_fit"] as const;
+const SUPPORTED_CHANNELS = ["body_fit", "face_fit", "style_fit"] as const;
 
 const scoreSchema = z.object({
   itemId: z.string().min(1).max(30),
@@ -219,8 +265,8 @@ router.post("/score", authenticate, async (req: AuthRequest, res) => {
 });
 
 // POST /match —— 当前登录用户 × 指定商品，计算所有已上线维度并按 ③C 汇总
-// 目前只有 body_fit + face_fit 上线（默认权重 30%，有效维度最多 2 个），
-// 总分一定是 insufficient_coverage（③C 第五节），这是预期行为
+// 目前 body_fit + face_fit + style_fit 上线（默认权重 50%，有效维度最多 3 个）。
+// 三个维度都有效（data_coverage ≥ 0.30）时才能算出总分，否则 insufficient_coverage（③C 第五节）
 const matchSchema = z.object({
   itemId: z.string().min(1).max(30),
   variantId: z.string().min(1).max(30).optional(),
@@ -293,6 +339,31 @@ router.get("/results", authenticate, async (req: AuthRequest, res) => {
 router.get("/rules/validate", authenticate, async (req: AuthRequest, res) => {
   try {
     const channel = typeof req.query.channel === "string" ? req.query.channel : "body_fit";
+
+    // style_fit 没有规则行，改为校验 4 个原因码是否齐全、方向是否正确（03A Part C 第七节）
+    if (channel === STYLE_FIT_CHANNEL) {
+      const rows = await db.select().from(matchingReasonCodes).where(eq(matchingReasonCodes.channel, STYLE_FIT_CHANNEL));
+      const errors: string[] = [];
+      for (const r of STYLE_FIT_REASONS) {
+        const hit = rows.filter(x => x.reasonCode === r.code);
+        if (hit.length === 0) errors.push(`缺少原因码 ${r.code}`);
+        else if (hit.length > 1) errors.push(`原因码重复 ${r.code}（${hit.length} 行）`);
+        else if (hit[0].outputDirection !== r.direction) errors.push(`${r.code} 方向应为 ${r.direction}，实际 ${hit[0].outputDirection}`);
+      }
+      const known = new Set<string>(STYLE_FIT_REASONS.map(r => r.code));
+      for (const x of rows) if (!known.has(x.reasonCode)) errors.push(`多余原因码 ${x.reasonCode}`);
+      return res.json({
+        channel,
+        engine_version: ENGINE_VERSION,
+        method: "formula",
+        rule_version: STYLE_FIT_RULE_VERSION,
+        reason_codes_expected: STYLE_FIT_REASONS.length,
+        reason_codes_found: rows.length,
+        passed: errors.length === 0,
+        errors,
+      });
+    }
+
     const { valid, errors, activeCount } = await loadValidatedRules(channel);
     const scoring = valid.filter(r => !isHardConstraint(r));
     const units = new Set(scoring.map(r => `${r.subDimension}|${r.humanField}|${r.itemField}`));

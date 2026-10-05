@@ -7,6 +7,7 @@ import {
   fashionItems, fashionItemVariants, fashionItemFieldSources, fashionItemMaterialAttributes,
   matchingRules, matchingReasonCodes, matchingResults,
   profileStyleScores, fashionItemStyleScores,
+  fashionVariantColorAttributes, fashionVariantColorIdentity,
 } from "../../db/schema";
 import { eq, and, desc, isNull } from "drizzle-orm";
 import { authenticate, AuthRequest } from "../middleware/auth";
@@ -17,6 +18,7 @@ import {
 } from "./matching-core";
 import { aggregate, parsePriority, SCENARIOS, Dimension, DimensionInput } from "./matching-aggregate";
 import { computeStyleFit, STYLE_FIT_CHANNEL, STYLE_FIT_RULE_VERSION, STYLE_FIT_REASONS } from "./matching-style";
+import { computeColorFit, COLOR_FIT_CHANNEL, COLOR_FIT_RULE_VERSION, COLOR_FIT_REASONS, VariantResolution } from "./matching-color";
 
 // ══════════════════════════════════════════════════════════════════
 // AIFFD Matching Engine V1.0 —— 路由与数据读取
@@ -27,6 +29,8 @@ import { computeStyleFit, STYLE_FIT_CHANNEL, STYLE_FIT_RULE_VERSION, STYLE_FIT_R
 // 注册新字段，在下面的 SUPPORTED_CHANNELS 加通道名；需要限定品类时在 CHANNEL_CATEGORY_SCOPE 登记。
 // 已上线：body_fit（2026-09）、face_fit（2026-10-01）、style_fit（2026-10-03）。
 // style_fit 不走规则表，计分在 matching-style.ts（03A Part C）。
+// color_fit（2026-10-04，03A Part D V0.1）：计分在 matching-color.ts，参数仍为 provisional，
+// 只开放 /score，不加入 /match（见下方 MATCH_CHANNELS）；矩阵定稿为 V1.0 后再加入汇总。
 // ══════════════════════════════════════════════════════════════════
 
 export { ENGINE_VERSION };
@@ -93,6 +97,27 @@ async function loadMaterial(itemId: string, variantId: string | null) {
   return i[0] ?? null;
 }
 
+// Color Fit 的变体解析（03A Part D 第二节）：传了 variantId 用它（归属已在上面校验）；
+// 没传且商品恰有一个变体时自动采用（auto_single）；多个变体不猜（ambiguous）；没有变体（none）
+async function resolveColorVariant(itemId: string, variant: typeof fashionItemVariants.$inferSelect | null) {
+  if (variant) return { resolution: "explicit" as VariantResolution, variantId: variant.variantId };
+  const vs = await db.select({ variantId: fashionItemVariants.variantId }).from(fashionItemVariants)
+    .where(eq(fashionItemVariants.itemId, itemId)).limit(2);
+  if (vs.length === 0) return { resolution: "none" as VariantResolution, variantId: null };
+  if (vs.length === 1) return { resolution: "auto_single" as VariantResolution, variantId: vs[0].variantId };
+  return { resolution: "ambiguous" as VariantResolution, variantId: null };
+}
+
+// 色彩行只按变体读取（两张表没有商品级的行，不存在回退）；最多取 2 行，用于发现同一变体重复行
+async function loadVariantColor(variantId: string | null) {
+  if (!variantId) return { attrs: [], ident: [] };
+  const attrs = await db.select().from(fashionVariantColorAttributes)
+    .where(eq(fashionVariantColorAttributes.variantId, variantId)).limit(2);
+  const ident = await db.select().from(fashionVariantColorIdentity)
+    .where(eq(fashionVariantColorIdentity.variantId, variantId)).limit(2);
+  return { attrs, ident };
+}
+
 // ── 单维度计分 ───────────────────────────────────────────────────
 async function scoreChannel(channel: string, profile: Profile, itemId: string, variantId: string | null) {
   const itemRows = await db.select().from(fashionItems).where(eq(fashionItems.itemId, itemId)).limit(1);
@@ -119,8 +144,58 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
   let exact: { data_coverage: number };
   let detail: Record<string, unknown>;
   let unitValidationErrorCount: number;
+  // 写进 matching_results 的变体：一般就是请求里的 variantId；color_fit 用解析后的实际变体
+  let resultVariantId: string | null = variantId;
 
-  if (channel === STYLE_FIT_CHANNEL) {
+  if (channel === COLOR_FIT_CHANNEL) {
+    // ── Color Fit（03A Part D V0.1）：冷暖 / 季型 / 副气三个单元，参数 provisional ──
+    const resolved = await resolveColorVariant(itemId, variant);
+    resultVariantId = resolved.variantId;
+    const { attrs, ident } = await loadVariantColor(resolved.variantId);
+    const itemSourceOf = await loadItemSources(itemId, resolved.variantId);
+    const humanEv = (field: string, value: unknown) => {
+      const src = humanSources.get(field);
+      return src
+        ? { value, confidence: HUMAN_SOURCE_CONFIDENCE[src] ?? HUMAN_NO_RECORD_CONFIDENCE, confidenceSource: "change_log" as const }
+        : { value, confidence: HUMAN_NO_RECORD_CONFIDENCE, confidenceSource: "no_record_fallback" as const };
+    };
+    const itemSrc = (field: string) => {
+      const s = itemSourceOf(field);
+      return s ? { sourceMethod: s.sourceMethod, verifiedStatus: s.verifiedStatus, confidence: s.confidence } : null;
+    };
+    const a = attrs.length === 1 ? attrs[0] : null;
+    const i = ident.length === 1 ? ident[0] : null;
+
+    const r = computeColorFit({
+      variantResolution: resolved.resolution,
+      human: {
+        warmCool: humanEv("warm_cool", profile.warmCool),
+        seasonName: humanEv("season_name", profile.seasonName),
+        elementName: humanEv("element_name", profile.elementName),
+        seasonElement: profile.seasonElement,
+        finalSeason25: profile.finalSeason25,
+      },
+      item: {
+        attributesRows: attrs.length,
+        identityRows: ident.length,
+        colorTemperature: { value: a?.colorTemperature ?? null, source: itemSrc("color_temperature") },
+        seasonName: { value: i?.seasonName ?? null, rowConfidence: i?.colorIdentityConfidence ?? null, source: itemSrc("season_name") },
+        elementName: { value: i?.elementName ?? null, rowConfidence: i?.colorIdentityConfidence ?? null, source: itemSrc("element_name") },
+        seasonElement: i?.seasonElement ?? null,
+        finalSeason25: i?.finalSeason25 ?? null,
+      },
+      reasonDir,
+    });
+    dimensionResult = r.dimensionResult;
+    exact = r.exact;
+    unitValidationErrorCount = r.detail.unit_validation_errors.length;
+    detail = {
+      ...r.detail,
+      requested_variant_id: variantId,
+      resolved_variant_id: resolved.variantId,
+      variant_updated_at: variant?.updatedAt ?? null,
+    };
+  } else if (channel === STYLE_FIT_CHANNEL) {
     // ── Style Fit（03A Part C）：人侧 13 型概率 × 商品各型适配度 ──
     const humanRows = await db.select().from(profileStyleScores)
       .where(eq(profileStyleScores.profileId, profile.profileId));
@@ -186,7 +261,7 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
     resultId,
     profileId: profile.profileId,
     itemId,
-    variantId,
+    variantId: resultVariantId,
     channel,
     score: score === null ? null : String(score),
     dataCoverage: String(data_coverage),
@@ -222,7 +297,7 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
       profile_id: profile.profileId,
       profile_version: profile.profileVersion,
       item_id: itemId,
-      variant_id: variantId,
+      variant_id: resultVariantId,
       item_updated_at: item.updatedAt,
       ...dimensionResult,
       detail,
@@ -234,7 +309,11 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
 // 路由
 // ══════════════════════════════════════════════════════════════════
 
-const SUPPORTED_CHANNELS = ["body_fit", "face_fit", "style_fit"] as const;
+// /score 可用的维度
+const SUPPORTED_CHANNELS = ["body_fit", "face_fit", "style_fit", "color_fit"] as const;
+// /match 参与汇总的维度。color_fit 参数仍为 provisional（03A Part D V0.1），暂不加入；
+// 矩阵与阈值定稿为 V1.0 后，在这里加上 "color_fit" 即可
+const MATCH_CHANNELS = ["body_fit", "face_fit", "style_fit"] as const;
 
 const scoreSchema = z.object({
   itemId: z.string().min(1).max(30),
@@ -264,8 +343,8 @@ router.post("/score", authenticate, async (req: AuthRequest, res) => {
   }
 });
 
-// POST /match —— 当前登录用户 × 指定商品，计算所有已上线维度并按 ③C 汇总
-// 目前 body_fit + face_fit + style_fit 上线（默认权重 50%，有效维度最多 3 个）。
+// POST /match —— 当前登录用户 × 指定商品，计算 MATCH_CHANNELS 里的维度并按 ③C 汇总
+// 目前 body_fit + face_fit + style_fit 参与汇总（默认权重 50%，有效维度最多 3 个）；color_fit 只在 /score 开放。
 // 三个维度都有效（data_coverage ≥ 0.30）时才能算出总分，否则 insufficient_coverage（③C 第五节）
 const matchSchema = z.object({
   itemId: z.string().min(1).max(30),
@@ -285,7 +364,7 @@ router.post("/match", authenticate, async (req: AuthRequest, res) => {
 
     const dimensions: Partial<Record<Dimension, DimensionInput>> = {};
     const skipped: { dimension: string; status: number; error: string; code?: string }[] = [];
-    for (const channel of SUPPORTED_CHANNELS) {
+    for (const channel of MATCH_CHANNELS) {
       const r = await scoreChannel(channel, profiles[0], itemId, variantId ?? null);
       if (r.status === 404) return res.status(404).json({ error: r.error });
       if (r.status !== 200) {
@@ -340,24 +419,30 @@ router.get("/rules/validate", authenticate, async (req: AuthRequest, res) => {
   try {
     const channel = typeof req.query.channel === "string" ? req.query.channel : "body_fit";
 
-    // style_fit 没有规则行，改为校验 4 个原因码是否齐全、方向是否正确（03A Part C 第七节）
-    if (channel === STYLE_FIT_CHANNEL) {
-      const rows = await db.select().from(matchingReasonCodes).where(eq(matchingReasonCodes.channel, STYLE_FIT_CHANNEL));
+    // 公式型维度（style_fit、color_fit）没有规则行，改为校验原因码是否齐全、方向是否正确
+    // （03A Part C 第七节、Part D 第七节）；reason_codes 数不是规则数
+    const FORMULA_CHANNELS: Record<string, { reasons: readonly { code: string; direction: string }[]; version: string }> = {
+      [STYLE_FIT_CHANNEL]: { reasons: STYLE_FIT_REASONS, version: STYLE_FIT_RULE_VERSION },
+      [COLOR_FIT_CHANNEL]: { reasons: COLOR_FIT_REASONS, version: COLOR_FIT_RULE_VERSION },
+    };
+    const formula = Object.prototype.hasOwnProperty.call(FORMULA_CHANNELS, channel) ? FORMULA_CHANNELS[channel] : null;
+    if (formula) {
+      const rows = await db.select().from(matchingReasonCodes).where(eq(matchingReasonCodes.channel, channel));
       const errors: string[] = [];
-      for (const r of STYLE_FIT_REASONS) {
+      for (const r of formula.reasons) {
         const hit = rows.filter(x => x.reasonCode === r.code);
         if (hit.length === 0) errors.push(`缺少原因码 ${r.code}`);
         else if (hit.length > 1) errors.push(`原因码重复 ${r.code}（${hit.length} 行）`);
         else if (hit[0].outputDirection !== r.direction) errors.push(`${r.code} 方向应为 ${r.direction}，实际 ${hit[0].outputDirection}`);
       }
-      const known = new Set<string>(STYLE_FIT_REASONS.map(r => r.code));
+      const known = new Set<string>(formula.reasons.map(r => r.code));
       for (const x of rows) if (!known.has(x.reasonCode)) errors.push(`多余原因码 ${x.reasonCode}`);
       return res.json({
         channel,
         engine_version: ENGINE_VERSION,
         method: "formula",
-        rule_version: STYLE_FIT_RULE_VERSION,
-        reason_codes_expected: STYLE_FIT_REASONS.length,
+        rule_version: formula.version,
+        reason_codes_expected: formula.reasons.length,
         reason_codes_found: rows.length,
         passed: errors.length === 0,
         errors,

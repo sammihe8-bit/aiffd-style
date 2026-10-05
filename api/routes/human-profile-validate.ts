@@ -67,3 +67,24 @@ export function validateStyleCodePatch(patch: Record<string, unknown>): string[]
   }
   return problems;
 }
+
+// ══════════════════════════════════════════════════════════════════
+// 变更日志字段名（2026-10-05）
+// 驼峰 → 下划线，数字段前也加下划线，与库列名一致：finalSeason25 → final_season_25。
+// 2026-10-05 之前的旧写法只在大写字母前加下划线，把 finalSeason25 记成了 final_season25；
+// 历史日志行不改，读取方用 normalizeChangeLogFieldName 把旧名称映射到列名，新旧记录按同一字段处理。
+// ══════════════════════════════════════════════════════════════════
+
+export function toSnakeCase(str: string): string {
+  return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`).replace(/([a-z])(\d)/g, "$1_$2");
+}
+
+const LEGACY_CHANGE_LOG_FIELD_NAMES: Record<string, string> = {
+  final_season25: "final_season_25",
+};
+
+export function normalizeChangeLogFieldName(name: string): string {
+  return Object.prototype.hasOwnProperty.call(LEGACY_CHANGE_LOG_FIELD_NAMES, name)
+    ? LEGACY_CHANGE_LOG_FIELD_NAMES[name]
+    : name;
+}

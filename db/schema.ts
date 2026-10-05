@@ -678,7 +678,7 @@ export const matchingResults = mysqlTable("matching_results", {
   variantId: varchar("variant_id", { length: 30 }),
   channel: varchar("channel", { length: 30 }).notNull(),
   score: decimal("score", { precision: 5, scale: 2 }),
-  dataCoverage: decimal("data_coverage", { precision: 4, scale: 3 }),
+  dataCoverage: decimal("data_coverage", { precision: 4, scale: 3 }).notNull(),
   ruleCoverage: decimal("rule_coverage", { precision: 4, scale: 3 }),
   confidence: decimal("confidence", { precision: 4, scale: 3 }),
   engineVersion: varchar("engine_version", { length: 20 }).notNull(),

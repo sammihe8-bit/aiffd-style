@@ -5,11 +5,13 @@ import {
   fashionItems, fashionItemVariants, fashionItemFieldSources,
   fashionItemStyleFeatures, fashionItemStyleScores, fashionItemStyleTags,
   fashionItemMaterialAttributes, fashionVariantColorAttributes, fashionVariantColorIdentity,
-  STYLE_CODES, STYLE_SOURCE_METHODS,
+  fashionItemImageTagAssessments,
+  STYLE_CODES, STYLE_SOURCE_METHODS, IMAGE_TAGS, IMAGE_TAG_VERIFIED_STATUSES,
 } from "../../db/schema";
 import { eq, and, isNull, desc } from "drizzle-orm";
 import { authenticate, requireRole, AuthRequest } from "../middleware/auth";
 import { validateItemStyleScores } from "./matching-style";
+import { validateItemImageTags } from "./image-tags";
 
 const router = Router();
 
@@ -85,11 +87,12 @@ router.get("/items/:itemId", authenticate, async (req: AuthRequest, res) => {
     if (itemRows.length === 0) return res.status(404).json({ error: "商品不存在" });
     const item = itemRows[0];
 
-    const [variants, styleScores, styleTags, materialAttrs] = await Promise.all([
+    const [variants, styleScores, styleTags, materialAttrs, imageTagAssessments] = await Promise.all([
       db.select().from(fashionItemVariants).where(eq(fashionItemVariants.itemId, itemId)),
       db.select().from(fashionItemStyleScores).where(eq(fashionItemStyleScores.itemId, itemId)),
       db.select().from(fashionItemStyleTags).where(eq(fashionItemStyleTags.itemId, itemId)),
       db.select().from(fashionItemMaterialAttributes).where(eq(fashionItemMaterialAttributes.itemId, itemId)),
+      db.select().from(fashionItemImageTagAssessments).where(eq(fashionItemImageTagAssessments.itemId, itemId)),
     ]);
 
     const variantIds = variants.map(v => v.variantId);
@@ -105,7 +108,7 @@ router.get("/items/:itemId", authenticate, async (req: AuthRequest, res) => {
     }
 
     res.json({
-      item, variants, styleScores, styleTags, materialAttributes: materialAttrs,
+      item, variants, styleScores, styleTags, materialAttributes: materialAttrs, imageTagAssessments,
       colorAttributesByVariant: colorAttrsByVariant,
       colorIdentityByVariant: colorIdentityByVariant,
     });
@@ -456,6 +459,53 @@ router.post("/items/:itemId/style-scores", authenticate, requireRole("admin"), a
     if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors[0].message });
     console.error("Save style scores error:", error);
     res.status(500).json({ error: "保存风格概率失败" });
+  }
+});
+
+// POST /items/:itemId/image-tags —— 整体替换商品的风格形象标签评估（2026-10-05，Preference Fit）
+//   12 个标签与人侧偏好测试同一套 id；没提交的标签 = 未评估（不当 0），score = 0 = 已评估但不符合
+//   V1 只写商品级（variant_id = NULL）；请求里带 variantId 会被拒绝（strict）
+//   删除旧评估与写入新评估在同一个事务里；空数组 = 清空这件商品的全部评估
+//   注意：与下面 /style-tags 的 15 个"可解释风格标签"是两套词汇
+const imageTagsSchema = z.object({
+  tags: z.array(z.object({
+    tagId: z.enum(IMAGE_TAGS),
+    score: z.number().min(0).max(1),
+    confidence: z.number().min(0).max(1).optional(),
+    sourceMethod: z.enum(STYLE_SOURCE_METHODS),
+    verifiedStatus: z.enum(IMAGE_TAG_VERIFIED_STATUSES).optional(),
+    engineVersion: z.string().max(20).optional(),
+    verifiedBy: z.string().max(50).optional(),
+  }).strict()),
+}).strict();
+router.post("/items/:itemId/image-tags", authenticate, requireRole("admin"), async (req: AuthRequest, res) => {
+  try {
+    const { itemId } = req.params;
+    const { tags } = imageTagsSchema.parse(req.body);
+    const problems = validateItemImageTags(tags);
+    if (problems.length > 0) return res.status(400).json({ error: "风格形象标签校验未通过", details: problems });
+
+    const itemRows = await db.select({ itemId: fashionItems.itemId }).from(fashionItems).where(eq(fashionItems.itemId, itemId)).limit(1);
+    if (itemRows.length === 0) return res.status(404).json({ error: "商品不存在" });
+
+    await db.transaction(async (tx) => {
+      await tx.delete(fashionItemImageTagAssessments)
+        .where(and(eq(fashionItemImageTagAssessments.itemId, itemId), isNull(fashionItemImageTagAssessments.variantId)));
+      for (const t of tags) {
+        await tx.insert(fashionItemImageTagAssessments).values({
+          itemId, variantId: null, tagId: t.tagId, score: t.score.toFixed(2),
+          confidence: t.confidence !== undefined ? t.confidence.toFixed(2) : null,
+          sourceMethod: t.sourceMethod, verifiedStatus: t.verifiedStatus ?? "unverified",
+          engineVersion: t.engineVersion ?? null, verifiedBy: t.verifiedBy ?? null,
+        });
+      }
+    });
+
+    res.json({ message: "风格形象标签评估已更新", count: tags.length });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors[0].message, details: error.errors });
+    console.error("Save image tags error:", error);
+    res.status(500).json({ error: "保存风格形象标签失败" });
   }
 });
 

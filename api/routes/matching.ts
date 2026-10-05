@@ -19,6 +19,7 @@ import {
 import { aggregate, parsePriority, SCENARIOS, Dimension, DimensionInput } from "./matching-aggregate";
 import { computeStyleFit, STYLE_FIT_CHANNEL, STYLE_FIT_RULE_VERSION, STYLE_FIT_REASONS } from "./matching-style";
 import { computeColorFit, COLOR_FIT_CHANNEL, COLOR_FIT_RULE_VERSION, COLOR_FIT_REASONS, VariantResolution } from "./matching-color";
+import { normalizeChangeLogFieldName } from "./human-profile-validate";
 
 // ══════════════════════════════════════════════════════════════════
 // AIFFD Matching Engine V1.0 —— 路由与数据读取
@@ -47,14 +48,18 @@ async function loadValidatedRules(channel: string) {
 }
 
 // ── 数据读取 ─────────────────────────────────────────────────────
-// 来源记录一次性批量读取（原来每个字段查一次），按 id 倒序取每个字段的最新一条
+// 来源记录一次性批量读取（原来每个字段查一次），按 id 倒序取每个字段的最新一条。
+// 字段名经 normalizeChangeLogFieldName 统一（历史行 final_season25 与新行 final_season_25 视为同一字段）
 async function loadHumanSources(profileId: string) {
   const rows = await db.select({ fieldName: profileFieldChangeLog.fieldName, source: profileFieldChangeLog.source })
     .from(profileFieldChangeLog)
     .where(eq(profileFieldChangeLog.profileId, profileId))
     .orderBy(desc(profileFieldChangeLog.id));
   const latest = new Map<string, string>();
-  for (const r of rows) if (!latest.has(r.fieldName)) latest.set(r.fieldName, r.source);
+  for (const r of rows) {
+    const name = normalizeChangeLogFieldName(r.fieldName);
+    if (!latest.has(name)) latest.set(name, r.source);
+  }
   return latest;
 }
 
@@ -99,13 +104,14 @@ async function loadMaterial(itemId: string, variantId: string | null) {
 
 // Color Fit 的变体解析（03A Part D 第二节）：传了 variantId 用它（归属已在上面校验）；
 // 没传且商品恰有一个变体时自动采用（auto_single）；多个变体不猜（ambiguous）；没有变体（none）
+// 返回实际使用的变体行，detail.variant_updated_at 取它的 updatedAt（auto_single 时也有值）
 async function resolveColorVariant(itemId: string, variant: typeof fashionItemVariants.$inferSelect | null) {
-  if (variant) return { resolution: "explicit" as VariantResolution, variantId: variant.variantId };
-  const vs = await db.select({ variantId: fashionItemVariants.variantId }).from(fashionItemVariants)
+  if (variant) return { resolution: "explicit" as VariantResolution, variant };
+  const vs = await db.select().from(fashionItemVariants)
     .where(eq(fashionItemVariants.itemId, itemId)).limit(2);
-  if (vs.length === 0) return { resolution: "none" as VariantResolution, variantId: null };
-  if (vs.length === 1) return { resolution: "auto_single" as VariantResolution, variantId: vs[0].variantId };
-  return { resolution: "ambiguous" as VariantResolution, variantId: null };
+  if (vs.length === 0) return { resolution: "none" as VariantResolution, variant: null };
+  if (vs.length === 1) return { resolution: "auto_single" as VariantResolution, variant: vs[0] };
+  return { resolution: "ambiguous" as VariantResolution, variant: null };
 }
 
 // 色彩行只按变体读取（两张表没有商品级的行，不存在回退）；最多取 2 行，用于发现同一变体重复行
@@ -150,9 +156,10 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
   if (channel === COLOR_FIT_CHANNEL) {
     // ── Color Fit（03A Part D V0.1）：冷暖 / 季型 / 副气三个单元，参数 provisional ──
     const resolved = await resolveColorVariant(itemId, variant);
-    resultVariantId = resolved.variantId;
-    const { attrs, ident } = await loadVariantColor(resolved.variantId);
-    const itemSourceOf = await loadItemSources(itemId, resolved.variantId);
+    const resolvedVariantId = resolved.variant?.variantId ?? null;
+    resultVariantId = resolvedVariantId;
+    const { attrs, ident } = await loadVariantColor(resolvedVariantId);
+    const itemSourceOf = await loadItemSources(itemId, resolvedVariantId);
     const humanEv = (field: string, value: unknown) => {
       const src = humanSources.get(field);
       return src
@@ -192,8 +199,8 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
     detail = {
       ...r.detail,
       requested_variant_id: variantId,
-      resolved_variant_id: resolved.variantId,
-      variant_updated_at: variant?.updatedAt ?? null,
+      resolved_variant_id: resolvedVariantId,
+      variant_updated_at: resolved.variant?.updatedAt ?? null,
     };
   } else if (channel === STYLE_FIT_CHANNEL) {
     // ── Style Fit（03A Part C）：人侧 13 型概率 × 商品各型适配度 ──

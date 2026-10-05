@@ -18,6 +18,9 @@ import { round, assertRange, scoreBand, itemSourceConfidence, Eligibility } from
 // 已确认：专用函数、40/40/20 权重、缺失单元归一化。
 // 待验证（provisional）：冷暖距离分值、季型相似度矩阵、五行关系分值、原因码阈值。
 // 这些参数集中在 COLOR_FIT_PARAMS，改参数不用改计分代码；validateColorFitParams 保证配置自洽。
+//
+// 派生字段一致性（03A Part D Q7，已确认）：两侧都检查 season_element、final_season_25 与基础字段是否一致，
+// 不改原值，冲突时停用受影响的单元并在 detail.derived_conflicts 记录；冷暖不受影响；派生字段缺失不反推。
 // ══════════════════════════════════════════════════════════════════
 
 export const COLOR_FIT_CHANNEL = "color_fit";
@@ -95,17 +98,21 @@ export const COLOR_FIT_PARAMS: ColorFitParams = {
   },
 };
 
-// 原因码（V0.1 评审参数）。文案只描述差异，不表达"禁止选择"。
+// 原因码（V0.1 评审参数，文案以 03A Part D 第七节为准）。文案只描述差异，不表达"禁止选择"。
 export const COLOR_FIT_REASONS = [
-  { code: "CF_TEMP_MATCH", direction: "strength", meaning: "这件单品的冷暖倾向和你的肤色底调接近" },
-  { code: "CF_SEASON_MATCH", direction: "strength", meaning: "这件单品的色彩季型和你的五季类型一致" },
-  { code: "CF_TEMP_CLASH", direction: "warning", meaning: "这件单品的冷暖倾向和你的肤色底调差异较大" },
-  { code: "CF_SEASON_CLASH", direction: "warning", meaning: "这件单品的色彩季型和你的五季类型差异较大" },
+  { code: "CF_TEMP_MATCH", direction: "strength", meaning: "这件单品的冷暖倾向与你较协调" },
+  { code: "CF_SEASON_MATCH", direction: "strength", meaning: "这件单品与你的季型一致" },
+  { code: "CF_TEMP_CLASH", direction: "warning", meaning: "冷暖方向差异较明显，可通过搭配衔接" },
+  { code: "CF_SEASON_CLASH", direction: "warning", meaning: "季型色彩方向差异较大，可调整搭配面积" },
 ] as const;
 
 const near = (a: number, b: number) => Math.abs(a - b) < 1e-9;
 const inUnit = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1;
 const pairKey = (a: string, b: string) => [a, b].sort().join("|");
+
+// 五季对应的季型主气（与前端 SEASON_META、src/utils/colorProfile.ts 一致），用于派生字段一致性检查
+export const SEASON_ELEMENT_MAP: Record<Season, Element> = { 春: "木", 夏: "火", 长夏: "土", 秋: "金", 冬: "水" };
+const FINAL_SEASON_25 = /^(春|夏|长夏|秋|冬)(木|火|土|金|水)$/;
 
 // ── 配置自洽校验：返回问题列表，空数组表示通过 ──
 export function validateColorFitParams(p: ColorFitParams): string[] {
@@ -189,7 +196,11 @@ export function validateColorFitParams(p: ColorFitParams): string[] {
 
 // ── 输入 ─────────────────────────────────────────────────────────
 // 人侧：字段值 + 该字段最新变更来源换算出的置信度（路由层用 HUMAN_SOURCE_CONFIDENCE 算好）
-export interface HumanColorEvidence { value: unknown; confidence: number }
+export interface HumanColorEvidence {
+  value: unknown;
+  confidence: number;
+  confidenceSource?: "change_log" | "no_record_fallback";   // 路由层标记：有变更来源记录 / 无记录按兜底
+}
 // 商品侧：字段值 + 行内置信度（只有 color_identity 有）+ fashion_item_field_sources 的来源记录（可空）
 export interface ItemColorEvidence {
   value: unknown;
@@ -203,13 +214,19 @@ export type VariantResolution = "explicit" | "auto_single" | "ambiguous" | "none
 
 export interface ColorFitInput {
   variantResolution: VariantResolution;
-  human: { warmCool: HumanColorEvidence; seasonName: HumanColorEvidence; elementName: HumanColorEvidence };
+  human: {
+    warmCool: HumanColorEvidence; seasonName: HumanColorEvidence; elementName: HumanColorEvidence;
+    seasonElement?: unknown;        // 派生字段，只做一致性检查，不计分
+    finalSeason25?: unknown;
+  };
   item: {
-    hasAttributesRow: boolean;      // 变体有 fashion_variant_color_attributes 行
-    hasIdentityRow: boolean;        // 变体有 fashion_variant_color_identity 行
+    attributesRows: number;         // 该变体在 fashion_variant_color_attributes 的行数（0 / 1；多于 1 行视为数据异常）
+    identityRows: number;           // 该变体在 fashion_variant_color_identity 的行数
     colorTemperature: ItemColorEvidence;
     seasonName: ItemColorEvidence;
     elementName: ItemColorEvidence;
+    seasonElement?: unknown;        // 派生字段，只做一致性检查，不计分
+    finalSeason25?: unknown;
   };
   reasonDir: Map<string, string>;   // reason_code → strength / warning（来自 matching_reason_codes）
   params?: ColorFitParams;
@@ -226,6 +243,7 @@ export interface ColorUnitDetail {
   missing_reason: string | null;
   unit_score: number | null;
   human_confidence: number | null;
+  human_confidence_source: "change_log" | "no_record_fallback" | null;
   item_confidence: number | null;
   item_confidence_source: "row" | "field_source" | "fallback" | null;
   confidence: number | null;
@@ -289,7 +307,8 @@ export function computeColorFit(input: ColorFitInput) {
     const iv = asStr(i.value);
     const base: ColorUnitDetail = {
       unit, weight: w, human_value: hv, item_value: iv, status: "missing", missing_reason: null,
-      unit_score: null, human_confidence: null, item_confidence: null, item_confidence_source: null,
+      unit_score: null, human_confidence: null, human_confidence_source: null,
+      item_confidence: null, item_confidence_source: null,
       confidence: null, contribution: null, evidence_group: group,
     };
     const miss = (reason: string) => { units.push({ ...base, missing_reason: reason }); };
@@ -299,11 +318,17 @@ export function computeColorFit(input: ColorFitInput) {
       unitValidationErrors.push({ unit, side: "human", reason: "invalid_value", value: hv });
       return miss("human_value_invalid");
     }
-    if (iv === null) return miss("item_value_missing");
+    if (iv === null) {
+      const state = group === "color_attributes" ? attrState : identState;
+      return miss(state === "duplicate" ? "item_rows_duplicate" : "item_value_missing");
+    }
     if (!legal.includes(iv)) {
       unitValidationErrors.push({ unit, side: "item", reason: "invalid_value", value: iv });
       return miss("item_value_invalid");
     }
+    const hd = disabled.human.has(unit), id = disabled.item.has(unit);
+    if (hd) return miss("human_derived_conflict");
+    if (id) return miss("item_derived_conflict");
     const hr = missingReasonOf(hv);
     if (hr) return miss(`human_${hr}`);
     const ir = missingReasonOf(iv);
@@ -320,36 +345,85 @@ export function computeColorFit(input: ColorFitInput) {
     const conf = Math.min(h.confidence, ic.conf);
     units.push({
       ...base, status: "scored", unit_score: s,
-      human_confidence: h.confidence, item_confidence: ic.conf, item_confidence_source: ic.from,
+      human_confidence: h.confidence, human_confidence_source: h.confidenceSource ?? null,
+      item_confidence: ic.conf, item_confidence_source: ic.from,
       confidence: conf, contribution: round(w * s, 6),
     });
   };
+
+  // ── 0. 派生字段一致性（Q7）：两侧分别检查，冲突只停用受影响的单元，不改原值、不反推缺失值 ──
+  const derivedConflicts: {
+    side: "human" | "item"; field: "season_element" | "final_season_25";
+    actual: string; expected: string | null; disabled_units: ColorUnit[];
+  }[] = [];
+  const disabled = { human: new Set<ColorUnit>(), item: new Set<ColorUnit>() };
+  const checkDerived = (side: "human" | "item", seasonRaw: unknown, elementRaw: unknown, seRaw: unknown, f25Raw: unknown) => {
+    const season = asStr(seasonRaw), element = asStr(elementRaw);
+    const seasonOk = season !== null && (SEASON_VALUES as readonly string[]).includes(season);
+    const elementOk = element !== null && (ELEMENT_VALUES as readonly string[]).includes(element);
+    const se = asStr(seRaw);
+    if (se !== null && seasonOk) {
+      const expected = SEASON_ELEMENT_MAP[season as Season];
+      if (se !== expected) {
+        derivedConflicts.push({ side, field: "season_element", actual: se, expected, disabled_units: ["season"] });
+        disabled[side].add("season");
+      }
+    }
+    const f25 = asStr(f25Raw);
+    if (f25 !== null && (seasonOk || elementOk)) {
+      const expected = seasonOk && elementOk ? `${season}${element}` : null;
+      const m = FINAL_SEASON_25.exec(f25);
+      const hit: ColorUnit[] = [];
+      if (!m) {
+        // 无法拆解定位：季型、副气都停用（冷暖不受影响）
+        if (seasonOk) hit.push("season");
+        if (elementOk) hit.push("element");
+      } else {
+        if (seasonOk && m[1] !== season) hit.push("season");
+        if (elementOk && m[2] !== element) hit.push("element");
+      }
+      if (hit.length > 0) {
+        derivedConflicts.push({ side, field: "final_season_25", actual: f25, expected, disabled_units: hit });
+        for (const u of hit) disabled[side].add(u);
+      }
+    }
+  };
+  checkDerived("human", input.human.seasonName.value, input.human.elementName.value, input.human.seasonElement, input.human.finalSeason25);
+
+  // 商品行数：0 行 = 没有该组数据；多于 1 行 = 数据异常，该组不使用（不挑其中一行）
+  const groupState = (n: number) => (n === 0 ? "none" : n === 1 ? "single" : "duplicate");
+  const attrState = groupState(input.item.attributesRows);
+  const identState = groupState(input.item.identityRows);
+  if (identState === "single") {
+    checkDerived("item", input.item.seasonName.value, input.item.elementName.value, input.item.seasonElement, input.item.finalSeason25);
+  }
 
   // ── 1. 变体与商品行 ──
   let skip: SkipReason | null = null;
   if (input.variantResolution === "ambiguous") skip = "variant_required";
   else if (input.variantResolution === "none") skip = "item_color_missing";
-  else if (!input.item.hasAttributesRow && !input.item.hasIdentityRow) skip = "item_color_missing";
+  else if (attrState === "none" && identState === "none") skip = "item_color_missing";
 
   // ── 2. 逐单元计分 ──
   const generating = new Set(params.elementGeneratingPairs.map(([a, b]) => pairKey(a, b)));
   const overcoming = new Set(params.elementOvercomingPairs.map(([a, b]) => pairKey(a, b)));
   if (!skip) {
-    const noAttr: ItemColorEvidence = { value: null };
-    const noIdent: ItemColorEvidence = { value: null };
+    const noRow: ItemColorEvidence = { value: null };
+    if (attrState === "duplicate") unitValidationErrors.push({ unit: "temperature", side: "item", reason: "duplicate_rows", value: String(input.item.attributesRows) });
+    if (identState === "duplicate") unitValidationErrors.push({ unit: "season", side: "item", reason: "duplicate_rows", value: String(input.item.identityRows) });
     pushUnit("temperature", "color_attributes", input.human.warmCool,
-      input.item.hasAttributesRow ? input.item.colorTemperature : noAttr,
+      attrState === "single" ? input.item.colorTemperature : noRow,
       WARM_COOL_VALUES, v => TEMPERATURE_MISSING_REASON[v] ?? null,
       (hv, iv) => {
         const d = Math.abs(params.temperatureAxis[hv] - params.temperatureAxis[iv]);
         return params.temperatureDistanceScore[d];
       });
     pushUnit("season", "color_identity", input.human.seasonName,
-      input.item.hasIdentityRow ? input.item.seasonName : noIdent,
+      identState === "single" ? input.item.seasonName : noRow,
       SEASON_VALUES, () => null,
       (hv, iv) => params.seasonSimilarity[hv as Season][iv as Season]);
     pushUnit("element", "color_identity", input.human.elementName,
-      input.item.hasIdentityRow ? input.item.elementName : noIdent,
+      identState === "single" ? input.item.elementName : noRow,
       ELEMENT_VALUES, () => null,
       (hv, iv) => {
         if (hv === iv) return params.elementScore.same;
@@ -428,6 +502,8 @@ export function computeColorFit(input: ColorFitInput) {
       variant_resolution: input.variantResolution,
       units,
       item_confidence_fallback_units: units.filter(u => u.item_confidence_source === "fallback").map(u => u.unit),
+      human_confidence_fallback_units: units.filter(u => u.human_confidence_source === "no_record_fallback").map(u => u.unit),
+      derived_conflicts: derivedConflicts,
       // 季型与副气都来自同一行 color_identity，是同一来源的证据，不代表两次独立验证
       shared_evidence_note: "season 与 element 共用 fashion_variant_color_identity 同一行，属同一来源证据",
       unit_validation_errors: unitValidationErrors,

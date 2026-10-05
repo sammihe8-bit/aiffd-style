@@ -1,7 +1,10 @@
 // 运行：npx tsx tests/human-profile-validate.test.ts
 // 离线测试 human-profile-validate.ts（Style 数据缺口修复，2026-10-02），不连数据库。
 import assert from "node:assert/strict";
-import { validateStyleScores, validateStyleCodePatch, roundProbability, StyleScoreInput } from "../api/routes/human-profile-validate";
+import {
+  validateStyleScores, validateStyleCodePatch, roundProbability, StyleScoreInput,
+  toSnakeCase, normalizeChangeLogFieldName,
+} from "../api/routes/human-profile-validate";
 import { STYLE_CODES } from "../db/schema";
 
 let passed = 0;
@@ -69,6 +72,24 @@ test("PATCH 主型 / 次型：13 型代码与 null 通过；中文名、小写�
   assert.deepEqual(validateStyleCodePatch({ styleElement: "金", eyeSize: "small" }), []);
   for (const v of ["戏剧少年型", "fg", "", 3, ["FG"], {}]) {
     assert.equal(validateStyleCodePatch({ primaryStyle: v }).length, 1, JSON.stringify(v));
+  }
+});
+
+test("变更日志字段名：数字段前加下划线，finalSeason25 → final_season_25；其他字段与旧写法一致", () => {
+  assert.equal(toSnakeCase("finalSeason25"), "final_season_25");
+  // 旧写法只在大写字母前加下划线；不带数字的字段新旧结果必须完全相同（避免把已有日志拆成两个名字）
+  const oldSnake = (s: string) => s.replace(/[A-Z]/g, l => `_${l.toLowerCase()}`);
+  for (const f of ["warmCool", "seasonName", "seasonElement", "elementName", "faceSharpnessScore",
+    "cheekboneProminence", "aspiredStylePrimary", "rejectedStyleCodes", "budgetMin", "lastActiveAt", "primaryStyle"]) {
+    assert.equal(toSnakeCase(f), oldSnake(f), f);
+  }
+});
+
+test("历史字段名兼容：final_season25 映射为 final_season_25，其他名称原样返回（含 toString、__proto__）", () => {
+  assert.equal(normalizeChangeLogFieldName("final_season25"), "final_season_25");
+  assert.equal(normalizeChangeLogFieldName("final_season_25"), "final_season_25");
+  for (const n of ["warm_cool", "season_name", "toString", "__proto__", "constructor", ""]) {
+    assert.equal(normalizeChangeLogFieldName(n), n, n);
   }
 });
 

@@ -2,6 +2,9 @@
 // 离线测试 matching-color.ts，不连数据库。覆盖 03A Part D Color Fit V0.1：枚举与 schema 一致、
 // 配置自洽校验、三个单元的全组合穷举、缺失归一化、覆盖率与置信度、原因码、变体与缺失处理、汇总层接入。
 // 测试数据取自 2026-10-04 线上查询：AIFFD_PROFILE_000001（版本 13）× AIFFD_VARIANT_000001（ITEM_000002）。
+//   人侧：warm / 夏 / 火 / 木 / 夏木，三个计分字段最新来源都是 color_test（0.80）
+//   商品：color_temperature neutral_warm，来源 manual_operator、confidence 0.85、unverified；
+//         color_identity 秋 / 金（10-04 已由"土"修正）/ 木 / 秋木，行内 confidence 0.80，季型与副气无来源记录
 // 注意：60.00 是草案矩阵下的预演值，不是正式 Color Fit 基准。
 import assert from "node:assert/strict";
 import {
@@ -19,31 +22,42 @@ const allReasons = () => new Map<string, string>(COLOR_FIT_REASONS.map(r => [r.c
 const clone = (): ColorFitParams => JSON.parse(JSON.stringify(COLOR_FIT_PARAMS));
 
 type Over = {
-  human?: Partial<Record<"warmCool" | "seasonName" | "elementName", { value?: unknown; confidence?: number }>>;
+  human?: Partial<Record<"warmCool" | "seasonName" | "elementName", { value?: unknown; confidence?: number; confidenceSource?: "change_log" | "no_record_fallback" }>>;
+  humanDerived?: { seasonElement?: unknown; finalSeason25?: unknown };
   item?: Partial<ColorFitInput["item"]>;
   variantResolution?: ColorFitInput["variantResolution"];
   reasonDir?: Map<string, string>;
   params?: ColorFitParams;
 };
-// 基准：测试账号 暖 / 夏 / 木（来源 color_test → 0.8）；变体 neutral_warm（无来源记录）/ 秋 / 木（行内 0.80，decimal 字符串）
-const run = (o: Over = {}) => computeColorFit({
-  variantResolution: o.variantResolution ?? "auto_single",
-  human: {
-    warmCool: { value: "warm", confidence: 0.8, ...o.human?.warmCool },
-    seasonName: { value: "夏", confidence: 0.8, ...o.human?.seasonName },
-    elementName: { value: "木", confidence: 0.8, ...o.human?.elementName },
-  },
-  item: {
-    hasAttributesRow: true,
-    hasIdentityRow: true,
-    colorTemperature: { value: "neutral_warm", source: null },
-    seasonName: { value: "秋", rowConfidence: "0.80" },
-    elementName: { value: "木", rowConfidence: "0.80" },
-    ...o.item,
-  },
-  reasonDir: o.reasonDir ?? allReasons(),
-  params: o.params,
-});
+// 基准取真实数据（见文件头）。改了某一侧季型 / 副气的用例，该侧派生字段默认置空，避免与基准派生值冲突；
+// 需要检查派生冲突的用例显式传入派生字段。
+const run = (o: Over = {}) => {
+  const humanBaseDerived = !o.human?.seasonName && !o.human?.elementName;
+  const itemBaseDerived = !o.item?.seasonName && !o.item?.elementName;
+  return computeColorFit({
+    variantResolution: o.variantResolution ?? "auto_single",
+    human: {
+      warmCool: { value: "warm", confidence: 0.8, confidenceSource: "change_log", ...o.human?.warmCool },
+      seasonName: { value: "夏", confidence: 0.8, confidenceSource: "change_log", ...o.human?.seasonName },
+      elementName: { value: "木", confidence: 0.8, confidenceSource: "change_log", ...o.human?.elementName },
+      seasonElement: humanBaseDerived ? "火" : null,
+      finalSeason25: humanBaseDerived ? "夏木" : null,
+      ...o.humanDerived,
+    },
+    item: {
+      attributesRows: 1,
+      identityRows: 1,
+      colorTemperature: { value: "neutral_warm", source: { sourceMethod: "manual_operator", verifiedStatus: "unverified", confidence: "0.85" } },
+      seasonName: { value: "秋", rowConfidence: "0.80" },
+      elementName: { value: "木", rowConfidence: "0.80" },
+      seasonElement: itemBaseDerived ? "金" : null,
+      finalSeason25: itemBaseDerived ? "秋木" : null,
+      ...o.item,
+    },
+    reasonDir: o.reasonDir ?? allReasons(),
+    params: o.params,
+  });
+};
 const unit = (r: ReturnType<typeof run>, u: string) => r.detail.units.find(x => x.unit === u)!;
 const toInput = (r: ReturnType<typeof run>): DimensionInput => ({
   score: r.dimensionResult.score, data_coverage: r.exact.data_coverage, rule_coverage: r.dimensionResult.rule_coverage,
@@ -111,15 +125,32 @@ test("测试账号 × ITEM_000002：60.00 / 1.000 / 1 / 0.800（预演值）", (
   assert.equal(r.detail.params_status, "provisional");
   assert.equal(r.detail.skip_reason, null);
   assert.deepEqual(r.detail.unit_validation_errors, []);
+  assert.deepEqual(r.detail.derived_conflicts, []);
 });
 
-test("商品侧兜底置信度在明细中标记：冷暖无来源记录 → fallback 0.80", () => {
+test("真实数据的置信度来源：冷暖商品侧取来源记录 0.85（min 后 0.80），季型 / 副气取行内 0.80，无兜底", () => {
   const r = run();
+  assert.equal(unit(r, "temperature").item_confidence_source, "field_source");
+  assert.equal(unit(r, "temperature").item_confidence, 0.85);
+  assert.equal(unit(r, "temperature").confidence, 0.8);
+  assert.equal(unit(r, "season").item_confidence_source, "row");
+  assert.equal(unit(r, "element").item_confidence_source, "row");
+  assert.deepEqual(r.detail.item_confidence_fallback_units, []);
+  assert.deepEqual(r.detail.human_confidence_fallback_units, []);
+  assert.equal(unit(r, "season").human_confidence_source, "change_log");
+  assert.ok(r.detail.shared_evidence_note.includes("同一来源"));
+});
+
+test("兜底标记：商品冷暖无来源记录 → fallback 0.80；人侧无变更记录 → no_record_fallback", () => {
+  const r = run({
+    item: { colorTemperature: { value: "neutral_warm", source: null } },
+    human: { warmCool: { value: "warm", confidence: 0.8, confidenceSource: "no_record_fallback" } },
+  });
   assert.equal(unit(r, "temperature").item_confidence_source, "fallback");
   assert.equal(unit(r, "temperature").item_confidence, 0.8);
-  assert.equal(unit(r, "season").item_confidence_source, "row");
   assert.deepEqual(r.detail.item_confidence_fallback_units, ["temperature"]);
-  assert.ok(r.detail.shared_evidence_note.includes("同一来源"));
+  assert.deepEqual(r.detail.human_confidence_fallback_units, ["temperature"]);
+  assert.equal(r.dimensionResult.score, 60);
 });
 
 // ── 三个单元全组合穷举 ─────────────────────────────────────────────
@@ -181,7 +212,7 @@ test("冷暖关键对照：中性暖 ↔ 中性冷 0.5；暖 ↔ 冷 0（触发 
 
 // ── 缺失单元归一化 ───────────────────────────────────────────────
 test("只有冷暖有效：score = 冷暖单元分 × 100，data_coverage 0.4", () => {
-  const r = run({ item: { hasIdentityRow: false } });
+  const r = run({ item: { identityRows: 0 } });
   assert.equal(r.dimensionResult.score, 80);
   assert.equal(r.exact.data_coverage, 0.4);
   assert.equal(r.dimensionResult.rule_coverage, 1);
@@ -224,7 +255,7 @@ test("变体：多个变体未指定 → variant_required；商品无变体 / �
   assert.equal(a.dimensionResult.score, null);
   assert.equal(a.detail.units.length, 0);
   assert.equal(run({ variantResolution: "none" }).detail.skip_reason, "item_color_missing");
-  const b = run({ item: { hasAttributesRow: false, hasIdentityRow: false } });
+  const b = run({ item: { attributesRows: 0, identityRows: 0 } });
   assert.equal(b.detail.skip_reason, "item_color_missing");
   assert.equal(b.dimensionResult.data_coverage, 0);
   assert.equal(run({ variantResolution: "explicit" }).detail.variant_resolution, "explicit");
@@ -284,8 +315,80 @@ test("原因码只输出 matching_reason_codes 里方向一致的码", () => {
   assert.ok(!s.dimensionResult.warnings.includes("CF_SEASON_CLASH"));
 });
 
-test("原因码文案不表达禁止", () => {
+test("原因码文案与 03A Part D 第七节一致，且不表达禁止", () => {
+  assert.deepEqual(COLOR_FIT_REASONS.map(r => [r.code, r.direction, r.meaning]), [
+    ["CF_TEMP_MATCH", "strength", "这件单品的冷暖倾向与你较协调"],
+    ["CF_SEASON_MATCH", "strength", "这件单品与你的季型一致"],
+    ["CF_TEMP_CLASH", "warning", "冷暖方向差异较明显，可通过搭配衔接"],
+    ["CF_SEASON_CLASH", "warning", "季型色彩方向差异较大，可调整搭配面积"],
+  ]);
   for (const r of COLOR_FIT_REASONS) assert.ok(!/不要|禁止|不能|避免|不适合/.test(r.meaning), r.code);
+});
+
+// ── 派生字段一致性（Q7：停用受影响单元并记录诊断，不改原值）──────────────
+test("Q7 商品 秋 → 土（10-04 修正前的真实数据）：只停用季型，冷暖 + 副气归一化 → 86.67", () => {
+  const r = run({ item: { seasonName: { value: "秋", rowConfidence: "0.80" }, elementName: { value: "木", rowConfidence: "0.80" }, seasonElement: "土", finalSeason25: "秋木" } });
+  assert.equal(unit(r, "season").status, "missing");
+  assert.equal(unit(r, "season").missing_reason, "item_derived_conflict");
+  assert.equal(unit(r, "element").status, "scored");
+  assert.equal(unit(r, "temperature").status, "scored");
+  assert.equal(r.dimensionResult.score, 86.67);   // (0.32 + 0.20) ÷ 0.6
+  assert.equal(r.dimensionResult.data_coverage, 0.6);
+  assert.deepEqual(r.detail.derived_conflicts, [
+    { side: "item", field: "season_element", actual: "土", expected: "金", disabled_units: ["season"] },
+  ]);
+  assert.ok(!r.dimensionResult.warnings.includes("CF_SEASON_CLASH"), "停用的单元不触发原因码");
+});
+
+test("Q7 final_season_25：季名不符停季型，五行不符停副气，都不符两项都停", () => {
+  const item = (f25: string) => run({ item: { seasonName: { value: "秋", rowConfidence: "0.8" }, elementName: { value: "木", rowConfidence: "0.8" }, seasonElement: "金", finalSeason25: f25 } });
+  const a = item("秋水");
+  assert.deepEqual(a.detail.derived_conflicts.map(c => c.disabled_units), [["element"]]);
+  assert.equal(a.dimensionResult.score, 50);       // (0.32 + 0.08) ÷ 0.8
+  const b = item("冬木");
+  assert.deepEqual(b.detail.derived_conflicts.map(c => c.disabled_units), [["season"]]);
+  const c = item("冬水");
+  assert.deepEqual(c.detail.derived_conflicts[0].disabled_units, ["season", "element"]);
+  assert.equal(c.dimensionResult.score, 80);       // 只剩冷暖
+  assert.equal(c.detail.derived_conflicts[0].expected, "秋木");
+});
+
+test("Q7 final_season_25 无法拆解（如 长夏·深木）：季型、副气都停，冷暖不受影响", () => {
+  const r = run({ human: { seasonName: { value: "长夏" }, elementName: { value: "木" } }, humanDerived: { seasonElement: "土", finalSeason25: "长夏·深木" } });
+  assert.equal(unit(r, "season").missing_reason, "human_derived_conflict");
+  assert.equal(unit(r, "element").missing_reason, "human_derived_conflict");
+  assert.equal(unit(r, "temperature").status, "scored");
+  assert.equal(r.dimensionResult.score, 80);
+  assert.equal(r.detail.derived_conflicts[0].side, "human");
+});
+
+test("Q7 人侧冲突与商品侧冲突分别检查；同一单元被两个派生字段命中只停一次", () => {
+  const r = run({
+    human: { seasonName: { value: "夏" }, elementName: { value: "木" } },
+    humanDerived: { seasonElement: "木", finalSeason25: "春木" },
+  });
+  assert.equal(r.detail.derived_conflicts.length, 2);
+  assert.ok(r.detail.derived_conflicts.every(c => c.side === "human"));
+  assert.equal(unit(r, "season").missing_reason, "human_derived_conflict");
+  assert.equal(r.detail.units.filter(u => u.unit === "season").length, 1);
+});
+
+test("Q7 派生字段缺失不算冲突、不反推；派生字段与基础字段一致时正常计分", () => {
+  const r = run({ humanDerived: { seasonElement: null, finalSeason25: null }, item: { seasonElement: null, finalSeason25: null } });
+  assert.deepEqual(r.detail.derived_conflicts, []);
+  assert.equal(r.dimensionResult.score, 60);
+  const ok = run({ human: { seasonName: { value: "长夏" }, elementName: { value: "土" } }, humanDerived: { seasonElement: "土", finalSeason25: "长夏土" } });
+  assert.deepEqual(ok.detail.derived_conflicts, []);
+});
+
+// ── 商品色彩行异常 ───────────────────────────────────────────────
+test("同一变体有多行 color_identity：该组不使用（不挑其中一行），记校验错误，冷暖照常计分", () => {
+  const r = run({ item: { identityRows: 2 } });
+  assert.equal(unit(r, "season").missing_reason, "item_rows_duplicate");
+  assert.equal(unit(r, "element").missing_reason, "item_rows_duplicate");
+  assert.equal(r.detail.unit_validation_errors.filter(e => e.reason === "duplicate_rows").length, 1);
+  assert.equal(r.dimensionResult.score, 80);
+  assert.deepEqual(r.detail.derived_conflicts, [], "重复行不做派生检查");
 });
 
 // ── 汇总层接入 ───────────────────────────────────────────────────

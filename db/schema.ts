@@ -199,6 +199,15 @@ export const humanStyleProfiles = mysqlTable("human_style_profiles", {
   colorPreferences: text("color_preferences"),
   fabricPreferences: text("fabric_preferences"),
 
+  // 风格形象标签偏好（2026-10-05，Preference Fit）：取值为 IMAGE_TAGS 的 id，存 JSON 数组字符串
+  //   NULL = 没做过偏好测试；"[]" = 做了但没有选（Q2"没有固定风格"、Q3"没有特别排斥的"）
+  //   上面的 aspired_style_* / current_style / rejected_style_codes 保留给 13 型代码，不写这 12 个标签
+  aspiredImageTags: text("aspired_image_tags"),                                    // Q1 理想形象，3～5 个
+  aspiredImageTagFavorite: varchar("aspired_image_tag_favorite", { length: 40 }),  // Q1 标星，须在 aspired_image_tags 里，可空
+  currentImageTags: text("current_image_tags"),                                    // Q2 实际常穿，0～3 个
+  currentImageStatus: mysqlEnum("current_image_status", ["selected", "no_fixed_style"]),
+  rejectedImageTags: text("rejected_image_tags"),                                  // Q3 明确不喜欢
+
   // 七、Lifestyle（详见 profile_lifestyle_scenarios 子表）
 
   // 八、Budget
@@ -346,6 +355,17 @@ export const STYLE_CODES = [
 // 2026-10-03：加 manual_operator（人工录入），与字段溯源表一致；fashion-item.ts 直接引用这里的定义
 export const STYLE_SOURCE_METHODS = ["rule_engine", "ai_image_analysis", "ai_text_analysis", "stylist", "manual_operator"] as const;
 
+// 12 个风格形象标签（2026-10-05）：偏好测试 Q1/Q2/Q3 与商品侧标签评估共用同一套 id。
+// 与前端 src/utils/fashionStyleOptions.ts 的 STYLE_OPTIONS 一一对应、顺序一致，改动须两边同步；
+// 库里 fashion_item_image_tag_assessments.tag_id 是 ENUM，新增标签只能在末尾追加。
+// 注意：与 fashion_item_style_tags 的 15 个"可解释风格标签"是两套词汇，不要混用。
+export const IMAGE_TAGS = [
+  "clean_intellectual", "relaxed_natural", "refined_elegant", "soft_romantic",
+  "crisp_professional", "urban_modern", "youthful_energetic", "artistic_individual",
+  "glamorous_mature", "androgynous_sharp", "vintage_literary", "oriental_refined",
+] as const;
+export const IMAGE_TAG_VERIFIED_STATUSES = ["unverified", "verified", "corrected", "rejected"] as const;
+
 export const fashionItems = mysqlTable("fashion_items", {
   id: int("id").primaryKey().autoincrement(),
   itemId: varchar("item_id", { length: 30 }).notNull().unique(),
@@ -481,6 +501,29 @@ export const fashionItemStyleScores = mysqlTable("fashion_item_style_scores", {
   sourceMethod: mysqlEnum("source_method", STYLE_SOURCE_METHODS).notNull(),
   engineVersion: varchar("engine_version", { length: 20 }),
   verifiedStatus: mysqlEnum("verified_status", ["unverified", "verified", "corrected"]).default("unverified").notNull(),
+  verifiedBy: varchar("verified_by", { length: 50 }),
+
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+// 商品风格形象标签评估（2026-10-05，Preference Fit）
+//   没有某标签的行 = 未评估（不当 0）；有行且 score = 0 = 已评估但不符合
+//   score 0～1，人工标注建议三档：1.00 符合 / 0.50 部分符合 / 0.00 不符合
+//   V1 只写商品级（variant_id 为 NULL），变体列预留；verified_status = rejected 的行不参与计分
+//   variant_id 可空，库里唯一索引挡不住 NULL 重复，由写入接口整体替换保证每个标签一行
+export const fashionItemImageTagAssessments = mysqlTable("fashion_item_image_tag_assessments", {
+  id: int("id").primaryKey().autoincrement(),
+  itemId: varchar("item_id", { length: 30 }).notNull(),
+  variantId: varchar("variant_id", { length: 30 }),
+
+  tagId: mysqlEnum("tag_id", IMAGE_TAGS).notNull(),
+  score: decimal("score", { precision: 3, scale: 2 }).notNull(),
+  confidence: decimal("confidence", { precision: 3, scale: 2 }),
+
+  sourceMethod: mysqlEnum("source_method", STYLE_SOURCE_METHODS).notNull(),
+  engineVersion: varchar("engine_version", { length: 20 }),
+  verifiedStatus: mysqlEnum("verified_status", IMAGE_TAG_VERIFIED_STATUSES).default("unverified").notNull(),
   verifiedBy: varchar("verified_by", { length: 50 }),
 
   createdAt: timestamp("created_at").defaultNow().notNull(),
@@ -635,7 +678,7 @@ export const matchingResults = mysqlTable("matching_results", {
   variantId: varchar("variant_id", { length: 30 }),
   channel: varchar("channel", { length: 30 }).notNull(),
   score: decimal("score", { precision: 5, scale: 2 }),
-  dataCoverage: decimal("data_coverage", { precision: 4, scale: 3 }).notNull(),
+  dataCoverage: decimal("data_coverage", { precision: 4, scale: 3 }),
   ruleCoverage: decimal("rule_coverage", { precision: 4, scale: 3 }),
   confidence: decimal("confidence", { precision: 4, scale: 3 }),
   engineVersion: varchar("engine_version", { length: 20 }).notNull(),

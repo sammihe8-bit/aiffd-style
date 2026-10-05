@@ -9,6 +9,7 @@ import {
 import { eq, and } from "drizzle-orm";
 import { authenticate, AuthRequest } from "../middleware/auth";
 import { validateStyleScores, validateStyleCodePatch, roundProbability, toSnakeCase } from "./human-profile-validate";
+import { validateProfileImageTagPatch } from "./image-tags";
 
 const router = Router();
 
@@ -50,6 +51,7 @@ const PATCHABLE_FIELDS = [
   "warmCool", "valueLevel", "saturationLevel", "seasonName", "seasonElement", "elementName", "finalSeason25",
   "aspiredStylePrimary", "aspiredStyleSecondary", "currentStyle", "currentAspiredStyleGap",
   "rejectedStyleCodes", "colorPreferences", "fabricPreferences",
+  "aspiredImageTags", "aspiredImageTagFavorite", "currentImageTags", "currentImageStatus", "rejectedImageTags",
   "budgetLevel", "budgetMin", "budgetMax", "currency", "priceSensitivity",
   "viewCount", "favoriteCount", "clickCount", "externalClickCount", "purchaseCount", "lastActiveAt",
   "outfitPhotoCount", "avgSatisfactionScore", "latestSelfRating", "latestStylistRating",
@@ -123,6 +125,14 @@ router.patch("/me", authenticate, async (req: AuthRequest, res) => {
     if (styleCodeProblems.length > 0) {
       return res.status(400).json({ error: styleCodeProblems[0], details: styleCodeProblems })
     }
+
+    // 2026-10-05：风格形象标签（偏好测试 Q1/Q2/Q3，Preference Fit 依赖）——只接受 12 个标签 id，
+    // 数量、"最喜欢"、常穿状态、理想与排斥不重叠等交叉校验用"提交后的完整状态"判断；数组按固定顺序存
+    const imageTagCheck = validateProfileImageTagPatch(patch, profile)
+    if (imageTagCheck.problems.length > 0) {
+      return res.status(400).json({ error: imageTagCheck.problems[0], details: imageTagCheck.problems })
+    }
+    Object.assign(patch, imageTagCheck.normalized)
 
     const changes: { fieldName: string; oldValue: string; newValue: string }[] = []
     const updateData: Record<string, unknown> = {}

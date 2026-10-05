@@ -8,7 +8,7 @@ import {
 } from "../../db/schema";
 import { eq, and } from "drizzle-orm";
 import { authenticate, AuthRequest } from "../middleware/auth";
-import { validateStyleScores, validateStyleCodePatch, roundProbability } from "./human-profile-validate";
+import { validateStyleScores, validateStyleCodePatch, roundProbability, toSnakeCase } from "./human-profile-validate";
 
 const router = Router();
 
@@ -16,9 +16,7 @@ const router = Router();
 // 工具函数
 // ══════════════════════════════════════════════════════════════════
 
-function toSnakeCase(str: string): string {
-  return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
-}
+// toSnakeCase 在 human-profile-validate.ts（2026-10-05：数字段前也加下划线，finalSeason25 → final_season_25）
 
 function formatProfileId(insertedId: number): string {
   return `AIFFD_PROFILE_${String(insertedId).padStart(6, "0")}`;

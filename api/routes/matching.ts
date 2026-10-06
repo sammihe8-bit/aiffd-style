@@ -8,6 +8,7 @@ import {
   matchingRules, matchingReasonCodes, matchingResults,
   profileStyleScores, fashionItemStyleScores,
   fashionVariantColorAttributes, fashionVariantColorIdentity,
+  fashionItemImageTagAssessments,
 } from "../../db/schema";
 import { eq, and, desc, isNull } from "drizzle-orm";
 import { authenticate, AuthRequest } from "../middleware/auth";
@@ -20,6 +21,7 @@ import { aggregate, parsePriority, SCENARIOS, Dimension, DimensionInput } from "
 import { computeStyleFit, STYLE_FIT_CHANNEL, STYLE_FIT_RULE_VERSION, STYLE_FIT_REASONS } from "./matching-style";
 import { computeColorFit, COLOR_FIT_CHANNEL, COLOR_FIT_RULE_VERSION, COLOR_FIT_REASONS, VariantResolution } from "./matching-color";
 import { normalizeChangeLogFieldName } from "./human-profile-validate";
+import { computePreferenceFit, PREFERENCE_FIT_CHANNEL, PREFERENCE_FIT_RULE_VERSION, PREFERENCE_FIT_REASONS } from "./matching-preference";
 
 // ══════════════════════════════════════════════════════════════════
 // AIFFD Matching Engine V1.0 —— 路由与数据读取
@@ -32,6 +34,7 @@ import { normalizeChangeLogFieldName } from "./human-profile-validate";
 // style_fit 不走规则表，计分在 matching-style.ts（03A Part C）。
 // color_fit（2026-10-04，03A Part D V0.1）：计分在 matching-color.ts，参数仍为 provisional，
 // 只开放 /score，不加入 /match（见下方 MATCH_CHANNELS）；矩阵定稿为 V1.0 后再加入汇总。
+// preference_fit（2026-10-06，03A Part E V0.1）：计分在 matching-preference.ts，参数 provisional，同样只开放 /score。
 // ══════════════════════════════════════════════════════════════════
 
 export { ENGINE_VERSION };
@@ -153,7 +156,36 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
   // 写进 matching_results 的变体：一般就是请求里的 variantId；color_fit 用解析后的实际变体
   let resultVariantId: string | null = variantId;
 
-  if (channel === COLOR_FIT_CHANNEL) {
+  if (channel === PREFERENCE_FIT_CHANNEL) {
+    // ── Preference Fit（03A Part E V0.1）：理想形象呼应 + 排斥避让，商品级标签评估，参数 provisional ──
+    // V1 只读商品级行（计分函数内部过滤 variant_id）；不做变体解析，请求里的 variantId 不影响计分
+    const itemRows = await db.select().from(fashionItemImageTagAssessments)
+      .where(eq(fashionItemImageTagAssessments.itemId, itemId));
+    const humanEv = (field: string) => {
+      const src = humanSources.get(field);
+      return src
+        ? { confidence: HUMAN_SOURCE_CONFIDENCE[src] ?? HUMAN_NO_RECORD_CONFIDENCE, confidenceSource: "change_log" as const }
+        : { confidence: HUMAN_NO_RECORD_CONFIDENCE, confidenceSource: "no_record_fallback" as const };
+    };
+    const r = computePreferenceFit({
+      human: {
+        aspiredImageTags: profile.aspiredImageTags,
+        aspiredImageTagFavorite: profile.aspiredImageTagFavorite,
+        rejectedImageTags: profile.rejectedImageTags,
+        aspiredConfidence: humanEv("aspired_image_tags"),
+        rejectedConfidence: humanEv("rejected_image_tags"),
+      },
+      itemRows: itemRows.map(x => ({
+        tagId: x.tagId, variantId: x.variantId, score: x.score, confidence: x.confidence,
+        sourceMethod: x.sourceMethod, verifiedStatus: x.verifiedStatus,
+      })),
+      reasonDir,
+    });
+    dimensionResult = r.dimensionResult;
+    exact = r.exact;
+    unitValidationErrorCount = r.detail.unit_validation_errors.length;
+    detail = { ...r.detail, profile_version: profile.profileVersion, item_updated_at: item.updatedAt };
+  } else if (channel === COLOR_FIT_CHANNEL) {
     // ── Color Fit（03A Part D V0.1）：冷暖 / 季型 / 副气三个单元，参数 provisional ──
     const resolved = await resolveColorVariant(itemId, variant);
     const resolvedVariantId = resolved.variant?.variantId ?? null;
@@ -317,9 +349,9 @@ async function scoreChannel(channel: string, profile: Profile, itemId: string, v
 // ══════════════════════════════════════════════════════════════════
 
 // /score 可用的维度
-const SUPPORTED_CHANNELS = ["body_fit", "face_fit", "style_fit", "color_fit"] as const;
-// /match 参与汇总的维度。color_fit 参数仍为 provisional（03A Part D V0.1），暂不加入；
-// 矩阵与阈值定稿为 V1.0 后，在这里加上 "color_fit" 即可
+const SUPPORTED_CHANNELS = ["body_fit", "face_fit", "style_fit", "color_fit", "preference_fit"] as const;
+// /match 参与汇总的维度。color_fit（03A Part D V0.1）、preference_fit（03A Part E V0.1）参数仍为 provisional，暂不加入；
+// 各自定稿为 V1.0 后，在这里加上对应维度即可
 const MATCH_CHANNELS = ["body_fit", "face_fit", "style_fit"] as const;
 
 const scoreSchema = z.object({
@@ -426,11 +458,12 @@ router.get("/rules/validate", authenticate, async (req: AuthRequest, res) => {
   try {
     const channel = typeof req.query.channel === "string" ? req.query.channel : "body_fit";
 
-    // 公式型维度（style_fit、color_fit）没有规则行，改为校验原因码是否齐全、方向是否正确
+    // 公式型维度（style_fit、color_fit、preference_fit）没有规则行，改为校验原因码是否齐全、方向是否正确
     // （03A Part C 第七节、Part D 第七节）；reason_codes 数不是规则数
     const FORMULA_CHANNELS: Record<string, { reasons: readonly { code: string; direction: string }[]; version: string }> = {
       [STYLE_FIT_CHANNEL]: { reasons: STYLE_FIT_REASONS, version: STYLE_FIT_RULE_VERSION },
       [COLOR_FIT_CHANNEL]: { reasons: COLOR_FIT_REASONS, version: COLOR_FIT_RULE_VERSION },
+      [PREFERENCE_FIT_CHANNEL]: { reasons: PREFERENCE_FIT_REASONS, version: PREFERENCE_FIT_RULE_VERSION },
     };
     const formula = Object.prototype.hasOwnProperty.call(FORMULA_CHANNELS, channel) ? FORMULA_CHANNELS[channel] : null;
     if (formula) {

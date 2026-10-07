@@ -12,6 +12,7 @@ import { eq, and, isNull, desc } from "drizzle-orm";
 import { authenticate, requireRole, AuthRequest } from "../middleware/auth";
 import { validateItemStyleScores } from "./matching-style";
 import { validateItemImageTags } from "./image-tags";
+import { checkColorIdentityConsistency } from "./matching-color";
 
 const router = Router();
 
@@ -387,7 +388,22 @@ router.post("/color-identity", authenticate, requireRole("admin"), async (req: A
   try {
     const data = colorIdentitySchema.parse(req.body);
     const existing = await db.select().from(fashionVariantColorIdentity)
-      .where(eq(fashionVariantColorIdentity.variantId, data.variantId)).limit(1);
+      .where(eq(fashionVariantColorIdentity.variantId, data.variantId)).limit(2);
+    // 同一变体有多行时，读取端（Color Fit）整组不使用；这里也不挑其中一行去改，要求先清理
+    if (existing.length > 1) {
+      return res.status(409).json({ error: "该变体有多行色彩身份，请先在数据库中清理重复行" });
+    }
+    // 2026-10-06：派生字段一致性校验（合并库里现值后整体检查），不一致直接拒绝，数据不变
+    const current = existing[0];
+    const problems = checkColorIdentityConsistency({
+      seasonName: data.seasonName ?? current?.seasonName ?? null,
+      seasonElement: data.seasonElement ?? current?.seasonElement ?? null,
+      elementName: data.elementName ?? current?.elementName ?? null,
+      finalSeason25: data.finalSeason25 ?? current?.finalSeason25 ?? null,
+    });
+    if (problems.length > 0) {
+      return res.status(400).json({ error: "派生字段与基础字段不一致", problems });
+    }
 
     const row: Record<string, unknown> = {
       seasonName: data.seasonName, seasonElement: data.seasonElement, elementName: data.elementName,

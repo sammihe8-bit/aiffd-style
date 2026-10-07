@@ -15,8 +15,11 @@ import { round, assertRange, scoreBand, itemSourceConfidence, Eligibility } from
 //   confidence    = Σ_有效单元 w·min(c人, c商品) ÷ Σ_有效单元 w；全部缺失时为 null
 // 输出与 computeDimension 相同的 Dimension Result，七维汇总层不改。
 //
-// 已确认：专用函数、40/40/20 权重、缺失单元归一化。
-// 待验证（provisional）：冷暖距离分值、季型相似度矩阵、五行关系分值、原因码阈值。
+// 已确认：专用函数、40/40/20 权重、缺失单元归一化；
+//   olive 处理（任一侧为 olive → 冷暖单元不可比较，按缺失处理）——确认的是处理规则，不代表 olive 的色彩关系已验证；
+//   五行关系 V1 无方向（同行 1.0 / 相生 0.7 / 相克 0.3，AIFFD 内部色彩关系编码，属产品参数）；
+//   具体方向只记录在 detail.element_relation 供后续研究，不改变分数；相克不代表对用户不利、不影响资格。（2026-10-06 产品确认）
+// 待验证（provisional）：冷暖距离分值、季型相似度矩阵、原因码阈值。
 // 这些参数集中在 COLOR_FIT_PARAMS，改参数不用改计分代码；validateColorFitParams 保证配置自洽。
 //
 // 派生字段一致性（03A Part D Q7，已确认）：两侧都检查 season_element、final_season_25 与基础字段是否一致，
@@ -38,7 +41,7 @@ export const COLOR_UNITS: readonly ColorUnit[] = ["temperature", "season", "elem
 
 // 合法但不计分的取值 → 该单元按缺失处理，明细里写明原因（不能静默给 0 分）
 //   uncertain：任一侧"不确定"
-//   olive：人的"橄榄底调"与商品的"橄榄色"是否同一概念尚未确认（03A Part D 待确认项）
+//   olive：人的"橄榄底调"（肤色底调）与商品的"橄榄色"（商品颜色）语义不同，不能直接比较（2026-10-06 产品确认）
 const TEMPERATURE_MISSING_REASON: Record<string, string> = {
   uncertain: "uncertain",
   olive: "olive_semantics_unconfirmed",
@@ -61,6 +64,8 @@ export interface ColorFitParams {
 
 // 季型相似度草案：同季 1.0；下列四组 0.5；其余 0.2。
 // 依据只是前端测试文案，尚未对照 AIFFD 五季的冷暖 / 明度 / 饱和度 / 对比度定义，不能作为正式矩阵。
+// 2026-10-06 产品评审：「夏–冬」相近缺乏依据（AIFFD 的夏是高明度高饱和，文案未说明高对比；冬未说明高饱和），
+// 待五季明度 / 饱和度定义补齐后按属性重新推导；在此之前整张矩阵保持 provisional，数值暂不改动。
 const S_SAME = 1.0, S_NEAR = 0.5, S_FAR = 0.2;
 const SEASON_NEAR_DRAFT: [Season, Season][] = [["春", "夏"], ["春", "秋"], ["秋", "长夏"], ["夏", "冬"]];
 function buildSeasonMatrix(): Record<Season, Record<Season, number>> {
@@ -90,9 +95,9 @@ export const COLOR_FIT_PARAMS: ColorFitParams = {
     unit_weights: "confirmed",
     missing_unit_normalization: "confirmed",
     temperature_axis: "provisional",
-    olive_handling: "provisional",
+    olive_handling: "confirmed",
     season_similarity: "provisional",
-    element_relation: "provisional",
+    element_relation: "confirmed",
     reason_thresholds: "provisional",
     item_confidence_fallback: "provisional",
   },
@@ -113,6 +118,24 @@ const pairKey = (a: string, b: string) => [a, b].sort().join("|");
 // 五季对应的季型主气（与前端 SEASON_META、src/utils/colorProfile.ts 一致），用于派生字段一致性检查
 export const SEASON_ELEMENT_MAP: Record<Season, Element> = { 春: "木", 夏: "火", 长夏: "土", 秋: "金", 冬: "水" };
 const FINAL_SEASON_25 = /^(春|夏|长夏|秋|冬)(木|火|土|金|水)$/;
+
+// ── 五行关系方向：只用于解释与研究，V1 计分不区分方向 ──
+export type ElementRelation = "same" | "generating" | "overcoming";
+export type ElementDirection = "human_generates_item" | "item_generates_human" | "human_overcomes_item" | "item_overcomes_human";
+export function describeElementRelation(
+  human: Element, item: Element, p: ColorFitParams = COLOR_FIT_PARAMS,
+): { relation: ElementRelation; direction: ElementDirection | null } {
+  if (human === item) return { relation: "same", direction: null };
+  for (const [a, b] of p.elementGeneratingPairs) {            // 配对按 [生者, 被生者] 书写
+    if (a === human && b === item) return { relation: "generating", direction: "human_generates_item" };
+    if (a === item && b === human) return { relation: "generating", direction: "item_generates_human" };
+  }
+  for (const [a, b] of p.elementOvercomingPairs) {            // 配对按 [克者, 被克者] 书写
+    if (a === human && b === item) return { relation: "overcoming", direction: "human_overcomes_item" };
+    if (a === item && b === human) return { relation: "overcoming", direction: "item_overcomes_human" };
+  }
+  throw new Error(`COLOR_FIT_ELEMENT_PAIR_UNMAPPED: ${human}/${item}`);
+}
 
 // ── 配置自洽校验：返回问题列表，空数组表示通过 ──
 export function validateColorFitParams(p: ColorFitParams): string[] {
@@ -437,6 +460,10 @@ export function computeColorFit(input: ColorFitInput) {
 
   // ── 3. 汇总 ──
   const scored = units.filter(u => u.status === "scored");
+  const elementUnit = scored.find(u => u.unit === "element");
+  const elementRelationDetail = elementUnit
+    ? { ...describeElementRelation(elementUnit.human_value as Element, elementUnit.item_value as Element, params), scored_with_direction: false }
+    : null;
   const wAll = COLOR_UNITS.reduce((a, u) => a + params.unitWeights[u], 0);
   const wV = scored.reduce((a, u) => a + u.weight, 0);
   if (!skip && scored.length === 0) skip = "no_scorable_units";
@@ -504,6 +531,8 @@ export function computeColorFit(input: ColorFitInput) {
       item_confidence_fallback_units: units.filter(u => u.item_confidence_source === "fallback").map(u => u.unit),
       human_confidence_fallback_units: units.filter(u => u.human_confidence_source === "no_record_fallback").map(u => u.unit),
       derived_conflicts: derivedConflicts,
+      // 副气单元计分时记录五行关系与方向；scored_with_direction 恒为 false（V1 不用方向改变分数）
+      element_relation: elementRelationDetail,
       // 季型与副气都来自同一行 color_identity，是同一来源的证据，不代表两次独立验证
       shared_evidence_note: "season 与 element 共用 fashion_variant_color_identity 同一行，属同一来源证据",
       unit_validation_errors: unitValidationErrors,

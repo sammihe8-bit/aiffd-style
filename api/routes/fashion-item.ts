@@ -43,8 +43,11 @@ const ITEM_PATCHABLE_FIELDS = [
   "silhouette", "shoulderStructure", "waistStructure", "fit", "garmentLength",
   "neckline", "baseSleeveLength", "sleeveShape", "structureLevel", "lineQuality",
   "visualVolume", "decorationLevel", "visualFocus",
-  "primaryStyle", "secondaryStyle", "styleConfidence",
 ] as const;
+
+// 主 / 次风格摘要（primary_style、secondary_style、style_confidence）只由 POST /items/:itemId/style-scores 同步，
+// 不允许通过 PATCH 直接修改，避免与 fashion_item_style_scores 不一致（02B 第六节：默认取最高分项）。2026-10-07
+const STYLE_SUMMARY_FIELDS: readonly string[] = ["primaryStyle", "secondaryStyle", "styleConfidence"];
 
 const VARIANT_PATCHABLE_FIELDS = [
   "sku", "colorNameSource", "sizeOptions", "price", "currency", "availability", "productUrl",
@@ -161,6 +164,14 @@ router.patch("/items/:itemId", authenticate, requireRole("admin"), async (req: A
     const itemRows = await db.select().from(fashionItems).where(eq(fashionItems.itemId, itemId)).limit(1);
     if (itemRows.length === 0) return res.status(404).json({ error: "商品不存在" });
     const item = itemRows[0];
+
+    const summaryKeys = Object.keys(patch).filter(k => STYLE_SUMMARY_FIELDS.includes(k));
+    if (summaryKeys.length > 0) {
+      return res.status(400).json({
+        error: "主 / 次风格摘要由风格适配度自动同步，不能直接修改；请改用 POST /items/:itemId/style-scores",
+        fields: summaryKeys,
+      });
+    }
 
     const validKeys = Object.keys(patch).filter(k => (ITEM_PATCHABLE_FIELDS as readonly string[]).includes(k));
     if (validKeys.length === 0) return res.status(400).json({ error: "没有提供任何可更新的字段" });
@@ -470,7 +481,7 @@ router.post("/items/:itemId/style-scores", authenticate, requireRole("admin"), a
       }
     });
 
-    res.json({ message: "风格概率分布已更新", count: scores.length });
+    res.json({ message: "风格适配度已更新", count: scores.length });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors[0].message });
     console.error("Save style scores error:", error);

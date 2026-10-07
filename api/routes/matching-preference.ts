@@ -305,7 +305,7 @@ export function computePreferenceFit(input: PreferenceFitInput) {
       expected_weight: round(B, 12),
       contribution_weight: round(G, 12),
       favorite,
-      units,
+      units: units.map(u => ({ ...u, contribution_weight: round(u.contribution_weight, 12) })),   // 只在输出时去掉浮点噪声；内部计算保持原值
       reason_basis: basis,
       item_assessment_scope: "item_level",
       item_rows_total: input.itemRows.length,

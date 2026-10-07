@@ -9,10 +9,13 @@
 import assert from "node:assert/strict";
 import {
   computeColorFit, validateColorFitParams, COLOR_FIT_PARAMS, COLOR_FIT_REASONS, ColorFitParams, ColorFitInput,
-  WARM_COOL_VALUES, SEASON_VALUES, ELEMENT_VALUES, Season,
+  WARM_COOL_VALUES, SEASON_VALUES, ELEMENT_VALUES, Season, checkColorIdentityConsistency,
 } from "../api/routes/matching-color";
 import { aggregate, DimensionInput, MIN_DIMENSION_DATA_COVERAGE } from "../api/routes/matching-aggregate";
 import { humanStyleProfiles, fashionVariantColorAttributes, fashionVariantColorIdentity } from "../db/schema";
+
+// 前端 SEASON_META 的五季主气，独立写一份用于核对（不引用被测代码里的映射）
+const COLOR_SEASON_MAIN: Record<string, string> = { 春: "木", 夏: "火", 长夏: "土", 秋: "金", 冬: "水" };
 
 let passed = 0;
 const tests: [string, () => void][] = [];
@@ -424,6 +427,34 @@ test("olive：任一侧为 olive，冷暖单元按缺失处理，季型与副气
     assert.equal(unit(r, "element").status, "scored");
     assert.equal(r.exact.data_coverage, 0.6, "冷暖 0.4 不贡献覆盖率");
   }
+});
+
+test("写入端一致性：真实数据 秋/金/木/秋木 通过；10-04 前的 秋 → 土 被拒绝；全部为空也通过", () => {
+  const ok = { seasonName: "秋", seasonElement: "金", elementName: "木", finalSeason25: "秋木" };
+  assert.deepEqual(checkColorIdentityConsistency(ok), []);
+  assert.deepEqual(checkColorIdentityConsistency({ ...ok, seasonElement: "土" }),
+    [{ field: "season_element", reason: "mismatch", actual: "土", expected: "金" }]);
+  assert.deepEqual(checkColorIdentityConsistency({ seasonName: null, seasonElement: null, elementName: null, finalSeason25: null }), []);
+  assert.deepEqual(checkColorIdentityConsistency({ seasonName: "长夏", seasonElement: "土", elementName: null, finalSeason25: null }), [], "只填基础字段与对应主气");
+  for (const s of SEASON_VALUES) {
+    for (const e of ELEMENT_VALUES) {
+      const all = checkColorIdentityConsistency({ seasonName: s, seasonElement: COLOR_SEASON_MAIN[s], elementName: e, finalSeason25: `${s}${e}` });
+      assert.deepEqual(all, [], `${s}${e} 应通过`);
+    }
+  }
+});
+
+test("写入端一致性：final_season_25 季名或五行不符、无法拆解、缺基础字段 → 逐项报出", () => {
+  const base = { seasonName: "秋", seasonElement: "金", elementName: "木", finalSeason25: "秋木" };
+  assert.deepEqual(checkColorIdentityConsistency({ ...base, finalSeason25: "夏木" }),
+    [{ field: "final_season_25", reason: "mismatch", actual: "夏木", expected: "秋木" }]);
+  assert.deepEqual(checkColorIdentityConsistency({ ...base, finalSeason25: "秋水" })[0].reason, "mismatch");
+  assert.deepEqual(checkColorIdentityConsistency({ ...base, finalSeason25: "长夏·深木" })[0].reason, "unparseable");
+  assert.deepEqual(checkColorIdentityConsistency({ ...base, elementName: null })[0],
+    { field: "final_season_25", reason: "base_missing", actual: "秋木", expected: null });
+  assert.deepEqual(checkColorIdentityConsistency({ ...base, seasonName: null, finalSeason25: null })[0],
+    { field: "season_element", reason: "base_missing", actual: "金", expected: null });
+  assert.equal(checkColorIdentityConsistency({ seasonName: "夏", seasonElement: "土", elementName: "木", finalSeason25: "秋木" }).length, 2, "两处都错时都报出");
 });
 
 test("接入七维汇总：Body / Face / Style 基准 + Color 预演值 → 4 个有效维度", () => {

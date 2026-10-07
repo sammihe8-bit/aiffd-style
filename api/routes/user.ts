@@ -2,13 +2,11 @@ import { Router } from "express";
 import { db } from "../../db";
 import { users, subscriptions, styleDiagnoses } from "../../db/schema";
 import { eq, desc } from "drizzle-orm";
-import { authenticate, AuthRequest, requireRole } from "../middleware/auth";
+import { authenticate, AuthRequest, requireRole, generateToken } from "../middleware/auth";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import { z } from "zod";
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || "default-secret";
 
 router.get("/me", authenticate, async (req: AuthRequest, res) => {
   try {
@@ -85,11 +83,7 @@ router.post("/register", async (req, res) => {
     if (phone) insertData.phone = phone;
     const result = await db.insert(users).values(insertData);
     const insertedId = Number(result[0].insertId);
-    const token = jwt.sign(
-      { id: insertedId, email: email || null, role: "user", membershipTier: "free" },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    const token = generateToken(insertedId, email || null, "user", "free");
     res.json({
       message: "注册成功",
       token,

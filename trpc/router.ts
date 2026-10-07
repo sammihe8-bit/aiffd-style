@@ -4,18 +4,12 @@ import { db } from "../db";
 import { users, styleDiagnoses, styleSystems, subscriptions } from "../db/schema";
 import { eq, desc } from "drizzle-orm";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
+import { generateToken } from "../api/middleware/auth";
 
 const t = initTRPC.create();
 
 export const router = t.router;
 export const publicProcedure = t.procedure;
-
-const JWT_SECRET = process.env.JWT_SECRET || "default-secret";
-
-function generateToken(userId: number, email: string | null, role: string, membershipTier: string) {
-  return jwt.sign({ id: userId, email, role, membershipTier }, JWT_SECRET, { expiresIn: "7d" });
-}
 
 export const appRouter = router({
   health: publicProcedure.query(async () => {

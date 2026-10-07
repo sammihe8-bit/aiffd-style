@@ -79,11 +79,12 @@ test("枚举：冷暖 / 季型 / 五行与 schema.ts 人侧、商品侧定义完
 });
 
 // ── 配置 ──────────────────────────────────────────────────────────
-test("默认配置通过自洽校验，整体标记 provisional，已确认项只有权重与归一化", () => {
+test("默认配置通过自洽校验，整体标记 provisional；已确认项：权重、归一化、olive 处理、五行无方向关系", () => {
   assert.deepEqual(validateColorFitParams(COLOR_FIT_PARAMS), []);
   assert.equal(COLOR_FIT_PARAMS.status, "provisional");
   const confirmed = Object.entries(COLOR_FIT_PARAMS.paramStatus).filter(([, s]) => s === "confirmed").map(([k]) => k);
-  assert.deepEqual(confirmed.sort(), ["missing_unit_normalization", "unit_weights"]);
+  assert.deepEqual(confirmed.sort(), ["element_relation", "missing_unit_normalization", "olive_handling", "unit_weights"]);
+  assert.equal(COLOR_FIT_PARAMS.paramStatus.season_similarity, "provisional", "季型矩阵在五季属性补齐前保持 provisional");
 });
 
 test("配置校验：季型矩阵缺格 / 不对称 / 同季不为 1 / 越界都能发现", () => {
@@ -392,6 +393,39 @@ test("同一变体有多行 color_identity：该组不使用（不挑其中一�
 });
 
 // ── 汇总层接入 ───────────────────────────────────────────────────
+test("五行方向只写入 detail，不改变分数：我生 / 生我同为 0.7，我克 / 克我同为 0.3", () => {
+  const el = (h: string, i: string) => run({ human: { elementName: { value: h } }, item: { elementName: { value: i, rowConfidence: "0.80" } } });
+  const cases: [string, string, string, string | null, number][] = [
+    ["木", "木", "same", null, 1.0],
+    ["木", "火", "generating", "human_generates_item", 0.7],
+    ["火", "木", "generating", "item_generates_human", 0.7],
+    ["木", "土", "overcoming", "human_overcomes_item", 0.3],
+    ["土", "木", "overcoming", "item_overcomes_human", 0.3],
+  ];
+  for (const [h, i, relation, direction, s] of cases) {
+    const r = el(h, i);
+    assert.equal(unit(r, "element").unit_score, s, `${h}/${i}`);
+    assert.deepEqual(r.detail.element_relation, { relation, direction, scored_with_direction: false }, `${h}/${i}`);
+  }
+  assert.equal(el("木", "火").dimensionResult.score, el("火", "木").dimensionResult.score, "方向相反、分数相同");
+  assert.deepEqual(el("木", "土").dimensionResult.eligibility, { purchase: true, recommendation: true, styling: true }, "相克不影响资格");
+  assert.equal(run().detail.element_relation?.relation, "same", "真实快照：人 木 × 商品 木");
+  assert.equal(run({ item: { elementName: { value: null } } }).detail.element_relation, null, "副气单元缺失时不记录关系");
+});
+
+test("olive：任一侧为 olive，冷暖单元按缺失处理，季型与副气照常计分", () => {
+  const h = run({ human: { warmCool: { value: "olive" } } });
+  assert.equal(unit(h, "temperature").status, "missing");
+  assert.equal(unit(h, "temperature").missing_reason, "human_olive_semantics_unconfirmed");
+  const i = run({ item: { colorTemperature: { value: "olive", source: { sourceMethod: "manual_operator", verifiedStatus: "unverified", confidence: "0.85" } } } });
+  assert.equal(unit(i, "temperature").missing_reason, "item_olive_semantics_unconfirmed");
+  for (const r of [h, i]) {
+    assert.equal(unit(r, "season").status, "scored");
+    assert.equal(unit(r, "element").status, "scored");
+    assert.equal(r.exact.data_coverage, 0.6, "冷暖 0.4 不贡献覆盖率");
+  }
+});
+
 test("接入七维汇总：Body / Face / Style 基准 + Color 预演值 → 4 个有效维度", () => {
   const dim = (score: number, dc: number): DimensionInput => ({
     score, data_coverage: dc, rule_coverage: 1, confidence: 0.8,

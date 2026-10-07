@@ -87,6 +87,8 @@ test("测试账号 × ITEM_000002：88.89 / 0.900 / 1 / 0.800（预演值）", (
   assert.equal(Math.round(x.coverage * 1e6) / 1e6, Math.round((2 / 3) * 1e6) / 1e6);
   assert.deepEqual(x.unknown_tags, ["oriental_refined"]);
   assert.deepEqual(x.max_tags, ["soft_romantic"]);
+  assert.equal(x.contribution_weight, 0.2, "单元贡献权重不带浮点噪声");
+  assert.equal(d.contribution_weight, 0.7);
   assert.equal(r.detail.evidence_scope, "aspiration_and_avoidance");
   assert.equal(r.detail.expected_weight, 1);
   assert.equal(r.detail.contribution_weight, 0.9);

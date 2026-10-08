@@ -75,6 +75,31 @@ test("PATCH 主型 / 次型：13 型代码与 null 通过；中文名、小写�
   }
 });
 
+test("偏好侧 4 个旧 13 型字段：只收 13 型代码，拒收 12 个风格形象标签 id（2026-10-08）", () => {
+  assert.deepEqual(validateStyleCodePatch({
+    aspiredStylePrimary: "C", aspiredStyleSecondary: ["N", "SC"], currentStyle: "N", rejectedStyleCodes: ["R", "D"],
+  }), []);
+  assert.deepEqual(validateStyleCodePatch({ aspiredStyleSecondary: "N", currentStyle: [], rejectedStyleCodes: [] }), []);
+  assert.deepEqual(validateStyleCodePatch({
+    aspiredStylePrimary: null, aspiredStyleSecondary: null, currentStyle: null, rejectedStyleCodes: null,
+  }), []);
+  // 12 标签 id 写进旧字段 → 拒绝
+  for (const [k, v] of [
+    ["aspiredStylePrimary", "refined_elegant"], ["aspiredStyleSecondary", ["clean_intellectual"]],
+    ["currentStyle", ["relaxed_natural", "refined_elegant"]], ["rejectedStyleCodes", ["soft_romantic", "R"]],
+  ] as const) {
+    assert.equal(validateStyleCodePatch({ [k]: v }).length, 1, `${k}=${JSON.stringify(v)}`);
+  }
+  // 其他非法形状
+  assert.equal(validateStyleCodePatch({ aspiredStylePrimary: ["C"] }).length, 1);       // 主型不收数组
+  assert.equal(validateStyleCodePatch({ rejectedStyleCodes: ["R", "R"] }).length, 1);   // 重复
+  assert.equal(validateStyleCodePatch({ currentStyle: '["N"]' }).length, 1);            // JSON 字符串不算数组
+  assert.equal(validateStyleCodePatch({ currentStyle: "" }).length, 1);
+  assert.equal(validateStyleCodePatch({ rejectedStyleCodes: [3] }).length, 1);
+  // 新字段不受影响（由 validateProfileImageTagPatch 负责）
+  assert.deepEqual(validateStyleCodePatch({ aspiredImageTags: ["clean_intellectual", "relaxed_natural", "refined_elegant"] }), []);
+});
+
 test("变更日志字段名：数字段前加下划线，finalSeason25 → final_season_25；其他字段与旧写法一致", () => {
   assert.equal(toSnakeCase("finalSeason25"), "final_season_25");
   // 旧写法只在大写字母前加下划线；不带数字的字段新旧结果必须完全相同（避免把已有日志拆成两个名字）

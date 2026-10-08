@@ -5,6 +5,7 @@ import { STYLE_CODES } from "../../db/schema";
 // 2026-10-02 新增：Style 数据缺口修复
 //   1. POST /me/style-scores 的 13 型概率分布校验（对齐 01B 第四节）
 //   2. PATCH /me 里 primaryStyle / secondaryStyle 只接受 13 型代码
+//      （2026-10-08 扩展到 aspiredStylePrimary / aspiredStyleSecondary / currentStyle / rejectedStyleCodes）
 // ══════════════════════════════════════════════════════════════════
 
 const CODE_SET = new Set<string>(STYLE_CODES);
@@ -56,14 +57,30 @@ export function validateStyleScores(scores: StyleScoreInput[]): string[] {
   return problems;
 }
 
-// PATCH /me 里的主型 / 次型：只接受 13 型代码或 null（null 表示清空）
+// PATCH /me 里的 13 型代码字段（null 表示清空）
+//   primaryStyle / secondaryStyle / aspiredStylePrimary：单个 13 型代码
+//   aspiredStyleSecondary / currentStyle / rejectedStyleCodes：单个 13 型代码，或不重复的 13 型代码数组（可为 []）
+// 2026-10-08：补上偏好侧 4 个旧字段（03A Part E V0.3 第三节、第十一节第 2 步）。
+//   这 4 个字段保留 13 型语义，12 个风格形象标签 id 只能写进 aspiredImageTags 等新字段，这里一律拒绝。
+const SINGLE_CODE_FIELDS = ["primaryStyle", "secondaryStyle", "aspiredStylePrimary"] as const;
+const CODE_OR_LIST_FIELDS = ["aspiredStyleSecondary", "currentStyle", "rejectedStyleCodes"] as const;
+
 export function validateStyleCodePatch(patch: Record<string, unknown>): string[] {
   const problems: string[] = [];
-  for (const key of ["primaryStyle", "secondaryStyle"]) {
-    if (!(key in patch)) continue;
+  const has = (k: string) => Object.prototype.hasOwnProperty.call(patch, k);
+  const isCode = (v: unknown) => typeof v === "string" && CODE_SET.has(v);
+  for (const key of SINGLE_CODE_FIELDS) {
+    if (!has(key)) continue;
     const v = patch[key];
     if (v === null) continue;
-    if (typeof v !== "string" || !CODE_SET.has(v)) problems.push(`${key} 必须是 13 型代码（${STYLE_CODES.join(" / ")}）或 null，实际: ${JSON.stringify(v)}`);
+    if (!isCode(v)) problems.push(`${key} 必须是 13 型代码（${STYLE_CODES.join(" / ")}）或 null，实际: ${JSON.stringify(v)}`);
+  }
+  for (const key of CODE_OR_LIST_FIELDS) {
+    if (!has(key)) continue;
+    const v = patch[key];
+    if (v === null || isCode(v)) continue;
+    if (Array.isArray(v) && v.every(isCode) && new Set(v).size === v.length) continue;
+    problems.push(`${key} 必须是 13 型代码、不重复的 13 型代码数组或 null，实际: ${JSON.stringify(v)}`);
   }
   return problems;
 }

@@ -11,5 +11,17 @@ ALTER TABLE human_style_profiles
 ALTER TABLE human_style_profiles
   ADD COLUMN qixue_answers TEXT NULL AFTER qixue_state;
 
+-- 2026-10-16 实测：线上 aiffd_style 库里没有 test_progress 表（schema.ts 有定义但从未建表），
+-- 体型测试的续测存档因此一直写入失败。先按 schema.ts 建表（已存在则跳过），再确保枚举包含新类型。
+CREATE TABLE IF NOT EXISTS test_progress (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  test_type ENUM('body','style','color','fashion','color_season','color_element') NOT NULL,
+  status ENUM('in_progress','completed') NOT NULL,
+  data_json TEXT NOT NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 ALTER TABLE test_progress
   MODIFY COLUMN test_type ENUM('body','style','color','fashion','color_season','color_element') NOT NULL;

@@ -7,7 +7,8 @@ import { authenticate, AuthRequest } from "../middleware/auth";
 
 const router = Router();
 
-const testTypeEnum = z.enum(["body", "style", "color", "fashion"]);
+// 2026-10-16：增加 color_season / color_element，保存五季与五行副气测试的原始答题
+const testTypeEnum = z.enum(["body", "style", "color", "fashion", "color_season", "color_element"]);
 
 const saveSchema = z.object({
   testType: testTypeEnum,

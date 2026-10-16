@@ -1,4 +1,4 @@
-import { STYLE_CODES } from "../../db/schema";
+import { STYLE_CODES, QIXUE_STATES } from "../../db/schema";
 
 // ══════════════════════════════════════════════════════════════════
 // Human Profile 写入校验（纯函数，不访问数据库，可单独测试）
@@ -81,6 +81,41 @@ export function validateStyleCodePatch(patch: Record<string, unknown>): string[]
     if (v === null || isCode(v)) continue;
     if (Array.isArray(v) && v.every(isCode) && new Set(v).size === v.length) continue;
     problems.push(`${key} 必须是 13 型代码、不重复的 13 型代码数组或 null，实际: ${JSON.stringify(v)}`);
+  }
+  return problems;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 气血（2026-10-16 产品确认为正式档案维度）
+//   qixueState：五态之一或 null
+//   qixueAnswers：{ q1, q2, q3, q4 }，每题取值同为五态之一；或 null
+// 数据库列是严格枚举 / 文本，不合法的值在这里先挡成 400，避免写库时报 500
+// ══════════════════════════════════════════════════════════════════
+
+const QIXUE_SET = new Set<string>(QIXUE_STATES);
+const QIXUE_ANSWER_KEYS = ["q1", "q2", "q3", "q4"] as const;
+
+export function validateQixuePatch(patch: Record<string, unknown>): string[] {
+  const problems: string[] = [];
+  const has = (k: string) => Object.prototype.hasOwnProperty.call(patch, k);
+  if (has("qixueState")) {
+    const v = patch.qixueState;
+    if (v !== null && !(typeof v === "string" && QIXUE_SET.has(v))) {
+      problems.push(`qixueState 必须是 ${QIXUE_STATES.join(" / ")} 之一或 null，实际: ${JSON.stringify(v)}`);
+    }
+  }
+  if (has("qixueAnswers")) {
+    const v = patch.qixueAnswers;
+    if (v !== null) {
+      const isObj = typeof v === "object" && !Array.isArray(v);
+      const keys = isObj ? Object.keys(v as object).sort() : [];
+      const keysOk = isObj && keys.length === QIXUE_ANSWER_KEYS.length && QIXUE_ANSWER_KEYS.every(k => keys.includes(k));
+      const valuesOk = keysOk && QIXUE_ANSWER_KEYS.every(k => {
+        const a = (v as Record<string, unknown>)[k];
+        return typeof a === "string" && QIXUE_SET.has(a);
+      });
+      if (!valuesOk) problems.push(`qixueAnswers 必须是 { q1, q2, q3, q4 }，每题取值为 ${QIXUE_STATES.join(" / ")} 之一，或 null；实际: ${JSON.stringify(v)}`);
+    }
   }
   return problems;
 }

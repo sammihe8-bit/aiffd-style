@@ -8,7 +8,7 @@ import {
 } from "../../db/schema";
 import { eq, and } from "drizzle-orm";
 import { authenticate, AuthRequest } from "../middleware/auth";
-import { validateStyleScores, validateStyleCodePatch, roundProbability, toSnakeCase } from "./human-profile-validate";
+import { validateStyleScores, validateStyleCodePatch, validateQixuePatch, roundProbability, toSnakeCase } from "./human-profile-validate";
 import { validateProfileImageTagPatch } from "./image-tags";
 
 const router = Router();
@@ -47,7 +47,7 @@ const PATCHABLE_FIELDS = [
   "cheekboneShape", "chinLength", "chinShape", "eyeSize", "eyeShape", "eyeSpacing",
   "noseSize", "noseShape", "noseProjection", "jawline", "faceLine",
   "faceShape", "faceSharpnessLabel", "faceSharpnessScore", "faceSharpnessConfidence",
-  "primaryStyle", "secondaryStyle", "confidenceScore", "styleElement",
+  "primaryStyle", "secondaryStyle", "confidenceScore", "styleElement", "qixueState", "qixueAnswers",
   "warmCool", "valueLevel", "saturationLevel", "seasonName", "seasonElement", "elementName", "finalSeason25",
   "aspiredStylePrimary", "aspiredStyleSecondary", "currentStyle", "currentAspiredStyleGap",
   "rejectedStyleCodes", "colorPreferences", "fabricPreferences",
@@ -124,6 +124,17 @@ router.patch("/me", authenticate, async (req: AuthRequest, res) => {
     const styleCodeProblems = validateStyleCodePatch(patch)
     if (styleCodeProblems.length > 0) {
       return res.status(400).json({ error: styleCodeProblems[0], details: styleCodeProblems })
+    }
+
+    // 2026-10-16：气血两字段的取值校验（数据库是严格枚举，不合法值在这里挡成 400）
+    const qixueProblems = validateQixuePatch(patch)
+    if (qixueProblems.length > 0) {
+      return res.status(400).json({ error: qixueProblems[0], details: qixueProblems })
+    }
+    // 固定 q1→q4 的键顺序，同一组答案不会因提交顺序不同而多出变更日志
+    if (patch.qixueAnswers && typeof patch.qixueAnswers === "object") {
+      const a = patch.qixueAnswers as Record<string, string>
+      patch.qixueAnswers = { q1: a.q1, q2: a.q2, q3: a.q3, q4: a.q4 }
     }
 
     // 2026-10-05：风格形象标签（偏好测试 Q1/Q2/Q3，Preference Fit 依赖）——只接受 12 个标签 id，

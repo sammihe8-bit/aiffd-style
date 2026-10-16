@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import {
   validateStyleScores, validateStyleCodePatch, roundProbability, StyleScoreInput,
-  toSnakeCase, normalizeChangeLogFieldName,
+  toSnakeCase, normalizeChangeLogFieldName, validateQixuePatch,
 } from "../api/routes/human-profile-validate";
 import { STYLE_CODES } from "../db/schema";
 
@@ -116,6 +116,27 @@ test("历史字段名兼容：final_season25 映射为 final_season_25，其他�
   for (const n of ["warm_cool", "season_name", "toString", "__proto__", "constructor", ""]) {
     assert.equal(normalizeChangeLogFieldName(n), n, n);
   }
+});
+
+test("气血：五态之一或 null 合法；其他值、英文、空串 → 拒绝", () => {
+  for (const v of ["阴", "阴多阳少", "阴阳和谐", "阴少阳多", "阳", null]) {
+    assert.deepEqual(validateQixuePatch({ qixueState: v }), [], String(v));
+  }
+  for (const v of ["yin", "", "阴阳", 1]) {
+    assert.ok(validateQixuePatch({ qixueState: v }).length > 0, String(v));
+  }
+  assert.deepEqual(validateQixuePatch({ warmCool: "cool" }), [], "不带气血字段时不检查");
+});
+
+test("气血原始答案：必须恰好 q1~q4 且每题为五态之一；null 合法", () => {
+  const good = { q1: "阴", q2: "阳", q3: "阴阳和谐", q4: "阴少阳多" };
+  assert.deepEqual(validateQixuePatch({ qixueAnswers: good }), []);
+  assert.deepEqual(validateQixuePatch({ qixueAnswers: null }), []);
+  assert.ok(validateQixuePatch({ qixueAnswers: { q1: "阴", q2: "阳", q3: "阴" } }).length > 0, "缺题");
+  assert.ok(validateQixuePatch({ qixueAnswers: { ...good, q5: "阴" } }).length > 0, "多题");
+  assert.ok(validateQixuePatch({ qixueAnswers: { ...good, q2: "" } }).length > 0, "空答案");
+  assert.ok(validateQixuePatch({ qixueAnswers: ["阴", "阳", "阴", "阳"] }).length > 0, "数组");
+  assert.ok(validateQixuePatch({ qixueAnswers: "阴" }).length > 0, "字符串");
 });
 
 for (const [name, fn] of tests) {

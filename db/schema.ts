@@ -77,7 +77,8 @@ export const refreshTokens = mysqlTable("refresh_tokens", {
 export const testProgress = mysqlTable("test_progress", {
   id: int("id").primaryKey().autoincrement(),
   userId: int("user_id").notNull(),
-  testType: mysqlEnum("test_type", ["body", "style", "color", "fashion"]).notNull(),
+  // 2026-10-16：增加 color_season / color_element，保存五季、五行副气测试的原始答题（含发色、瞳色 A–F 选项）
+  testType: mysqlEnum("test_type", ["body", "style", "color", "fashion", "color_season", "color_element"]).notNull(),
   status: mysqlEnum("status", ["in_progress", "completed"]).notNull(),
   dataJson: text("data_json").notNull(),
   updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
@@ -104,6 +105,9 @@ const CHANGE_SOURCES = [
 ] as const;
 
 // ── 表：活档案（Living Profile）────────────────────────────────────
+// 气血（整体风格复核）五态，前端 StyleTestPage calcQiXue 的输出值，顺序从阴到阳
+export const QIXUE_STATES = ["阴", "阴多阳少", "阴阳和谐", "阴少阳多", "阳"] as const;
+
 export const humanStyleProfiles = mysqlTable("human_style_profiles", {
   id: int("id").primaryKey().autoincrement(),
   userId: int("user_id").notNull().unique(),
@@ -165,6 +169,10 @@ export const humanStyleProfiles = mysqlTable("human_style_profiles", {
   secondaryStyle: varchar("secondary_style", { length: 50 }),
   confidenceScore: decimal("confidence_score", { precision: 3, scale: 2 }),
   styleElement: mysqlEnum("style_element", ["木", "火", "土", "金", "水"]),
+  // 2026-10-16 产品确认：气血（整体风格复核 4 题）成为正式档案维度。
+  // qixue_state = 4 题计票后的五态之一；qixue_answers = 4 题原始选择 {q1..q4}，JSON 字符串
+  qixueState: mysqlEnum("qixue_state", QIXUE_STATES),
+  qixueAnswers: text("qixue_answers"),
 
   // 五、Color
   skinTone: mysqlEnum("skin_tone", [

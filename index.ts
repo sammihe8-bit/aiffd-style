@@ -11,6 +11,7 @@ import testProgressRoutes from "./api/routes/test-progress";
 import humanProfileRoutes from "./api/routes/human-profile";
 import fashionItemRoutes from "./api/routes/fashion-item";
 import matchingRoutes from "./api/routes/matching";
+import consentRoutes from "./api/routes/consents";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -33,6 +34,7 @@ app.use("/api/test-progress", testProgressRoutes);
 app.use("/api/human-profile", humanProfileRoutes);
 app.use("/api/fashion-item", fashionItemRoutes);
 app.use("/api/matching", matchingRoutes);
+app.use("/api/consents", consentRoutes);
 
 app.use((req, res) => res.status(404).json({ error: "接口不存在" }));
 

@@ -282,6 +282,11 @@ export const userConsents = mysqlTable("user_consents", {
   photoConsent: boolean("photo_consent").notNull(),
   researchDataConsent: boolean("research_data_consent").notNull(),
   policyVersion: varchar("policy_version", { length: 30 }).notNull(),
+  // 2026-10-18 新增：用户实际同意的时间（Onboarding 提交时刻；补传时取浏览器本机记录里的时间）
+  consentedAt: timestamp("consented_at"),
+  // 2026-10-18 新增：onboarding = 用户在 Onboarding 提交时直接写入；
+  // local_backfill = 从浏览器本机旧记录补传，时间与内容为浏览器自报，证据力弱于 onboarding
+  source: mysqlEnum("source", ["onboarding", "local_backfill"]).default("onboarding").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 

@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 
 export interface AuthRequest extends Request {
-  user?: { id: number; email: string; role: string; membershipTier: string };
+  user?: { id: number; email: string | null; role: string; membershipTier: string };
 }
 
 // JWT_SECRET 必须由环境变量提供；没有配置、为空或等于仓库里出现过的默认值时，拒绝启动。
@@ -28,7 +28,17 @@ export function generateToken(userId: number, email: string | null, role: string
 }
 
 export function verifyToken(token: string): any {
-  try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
+    // Only accept complete, expiring application identities, even when signed.
+    if (typeof decoded !== "object" || decoded === null) return null;
+    if (!Number.isSafeInteger(decoded.id) || decoded.id <= 0) return null;
+    if (!(decoded.email === null || typeof decoded.email === "string")) return null;
+    if (!["user", "stylist", "admin"].includes(decoded.role)) return null;
+    if (!["free", "basic", "premium", "vip"].includes(decoded.membershipTier)) return null;
+    if (typeof decoded.exp !== "number" || !Number.isFinite(decoded.exp)) return null;
+    return decoded;
+  } catch { return null; }
 }
 
 export async function authenticate(req: AuthRequest, res: Response, next: NextFunction) {

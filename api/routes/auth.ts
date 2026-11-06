@@ -51,7 +51,7 @@ router.post("/register", async (req, res) => {
     console.error("Register error:", error);
     if (error instanceof z.ZodError)
       return res.status(400).json({ error: error.errors[0].message });
-    res.status(500).json({ error: "注册失败", detail: String(error) });
+    res.status(500).json({ error: "注册失败" });
   }
 });
 
@@ -93,7 +93,7 @@ router.post("/login", async (req, res) => {
     console.error("Login error:", error);
     if (error instanceof z.ZodError)
       return res.status(400).json({ error: error.errors[0].message });
-    res.status(500).json({ error: "登录失败", detail: String(error) });
+    res.status(500).json({ error: "登录失败" });
   }
 });
 

@@ -303,7 +303,8 @@ export const userConsents = mysqlTable("user_consents", {
   consentedAt: timestamp("consented_at"),
   // 2026-10-18 新增：onboarding = 用户在 Onboarding 提交时直接写入；
   // local_backfill = 从浏览器本机旧记录补传，时间与内容为浏览器自报，证据力弱于 onboarding
-  source: mysqlEnum("source", ["onboarding", "local_backfill"]).default("onboarding").notNull(),
+  // 2026-11-12 新增 profile_update = 用户在「我的档案」里修改两项可选授权（含撤回）
+  source: mysqlEnum("source", ["onboarding", "local_backfill", "profile_update"]).default("onboarding").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 

@@ -5,7 +5,9 @@ import { z } from "zod";
 // 2026-10-18 新增：Onboarding 的 4 项授权写入 user_consents（01A V1.1 第十二节）
 // ══════════════════════════════════════════════════════════════════
 
-export const CONSENT_SOURCES = ["onboarding", "local_backfill"] as const;
+// profile_update（2026-11-12）：用户在「我的档案」里修改两项可选授权（含撤回）。必选两项仍须为 true，
+// 每次修改追加一行，旧行保留作为证据；同意时间以服务器时间为准。
+export const CONSENT_SOURCES = ["onboarding", "local_backfill", "profile_update"] as const;
 
 // 允许的同意时间：不早于平台开始收集同意的日期，不晚于服务器当前时间 + 5 分钟（容忍设备时钟偏差）
 const EARLIEST_CONSENT = Date.parse("2026-08-01T00:00:00Z");
@@ -29,9 +31,9 @@ export const consentInputSchema = z.object({
 
 export type ConsentInput = z.infer<typeof consentInputSchema>;
 
-// onboarding：同意时间以服务器收到请求的时间为准，忽略客户端上报；
+// onboarding / profile_update：同意时间以服务器收到请求的时间为准，忽略客户端上报；
 // local_backfill：没有服务器时间可用，只能采用浏览器本机记录里的时间（必须提供）
 export function resolveConsentedAt(input: ConsentInput, now: Date): Date | null {
-  if (input.source === "onboarding") return now;
+  if (input.source === "onboarding" || input.source === "profile_update") return now;
   return input.consentedAt ? new Date(input.consentedAt) : null;
 }

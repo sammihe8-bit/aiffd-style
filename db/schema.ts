@@ -1,4 +1,4 @@
-import { mysqlTable, int, bigint, varchar, text, timestamp, decimal, mysqlEnum, boolean, json } from "drizzle-orm/mysql-core";
+import { mysqlTable, int, bigint, varchar, text, timestamp, decimal, mysqlEnum, boolean, json, uniqueIndex } from "drizzle-orm/mysql-core";
 
 // ══════════════════════════════════════════════════════════════════
 // 原有表（未改动，来自现有 aiffd-style 仓库 db/schema.ts）
@@ -272,6 +272,23 @@ export const profileFieldChangeLog = mysqlTable("profile_field_change_log", {
   changedByUserId: int("changed_by_user_id").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
+
+// ── 表：档案版本快照（2026-11-12 新增，01A V1.1 待建项）──────────────────
+// 每次档案发生变化（profile_version +1）都存一份变化后的完整档案：主表 + 13 型分布 + 生活场景 + 单品/视觉偏好 + 当前色彩信号。
+// 字段级变更日志回答“改了什么”，这张表回答“某个版本时档案整体是什么样”（匹配结果按 profile_version 追溯时用）。
+// snapshot_kind：revision = 本次变化后的状态；baseline = 建表前已存在的档案在第一次变化前补存的“变化前”状态。
+export const profileVersions = mysqlTable("profile_versions", {
+  id: int("id").primaryKey().autoincrement(),
+  profileId: varchar("profile_id", { length: 30 }).notNull(),
+  profileVersion: int("profile_version").notNull(),
+  snapshotKind: mysqlEnum("snapshot_kind", ["revision", "baseline"]).default("revision").notNull(),
+  snapshot: json("snapshot").notNull(),
+  source: mysqlEnum("source", CHANGE_SOURCES),
+  changedByUserId: int("changed_by_user_id"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => ({
+  profileVersionUnique: uniqueIndex("uniq_profile_version").on(t.profileId, t.profileVersion),
+}));
 
 // ── 表：隐私同意记录 ────────────────────────────────────────────
 export const userConsents = mysqlTable("user_consents", {

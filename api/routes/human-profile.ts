@@ -10,6 +10,8 @@ import { eq, and } from "drizzle-orm";
 import { authenticate, AuthRequest } from "../middleware/auth";
 import { validateStyleScores, validateStyleCodePatch, validateQixuePatch, roundProbability, toSnakeCase } from "./human-profile-validate";
 import { validateProfileImageTagPatch } from "./image-tags";
+import { lockProfile, commitRevision, type ChangeSource } from "./profile-revision";
+import { diffProfileFields, stringifyFieldValue, canonicalStyleScores, canonicalScenarios } from "./profile-revision-core";
 
 const router = Router();
 
@@ -68,11 +70,13 @@ const patchSchema = z.object({
   changedByUserId: z.number().int().optional(),
 })
 
-function stringifyFieldValue(v: unknown): string {
-  if (v === null || v === undefined) return ""
-  if (typeof v === "object") return JSON.stringify(v)
-  return String(v)
+// 事务里发现请求不合法时抛这个，外层统一转成 400（事务随之回滚）
+class BadRequest extends Error {
+  constructor(message: string, public details?: string[]) { super(message) }
 }
+
+// 子表接口可选带 source；不带时用各接口的默认来源
+const changeSourceSchema = patchSchema.shape.source
 
 // GET /me —— 获取当前用户完整档案（活档案 + 各子表聚合）
 router.get("/me", authenticate, async (req: AuthRequest, res) => {
@@ -137,58 +141,31 @@ router.patch("/me", authenticate, async (req: AuthRequest, res) => {
       patch.qixueAnswers = { q1: a.q1, q2: a.q2, q3: a.q3, q4: a.q4 }
     }
 
-    // 2026-10-05：风格形象标签（偏好测试 Q1/Q2/Q3，Preference Fit 依赖）——只接受 12 个标签 id，
-    // 数量、"最喜欢"、常穿状态、理想与排斥不重叠等交叉校验用"提交后的完整状态"判断；数组按固定顺序存
-    const imageTagCheck = validateProfileImageTagPatch(patch, profile)
-    if (imageTagCheck.problems.length > 0) {
-      return res.status(400).json({ error: imageTagCheck.problems[0], details: imageTagCheck.problems })
-    }
-    Object.assign(patch, imageTagCheck.normalized)
+    // 2026-11-12：以下在同一个事务里完成——锁住档案行后再做依赖现有档案的校验、比较差异、
+    // 写主表、升版本、写字段日志、存快照；任一步失败整体回滚（profile-revision.ts）
+    const changedByUid = changedByUserId ?? req.user!.id
+    const { row, changes } = await db.transaction(async (tx) => {
+      const locked = await lockProfile(tx, profile.id)
+      // 2026-10-05：风格形象标签（偏好测试 Q1/Q2/Q3，Preference Fit 依赖）——只接受 12 个标签 id，
+      // 数量、"最喜欢"、常穿状态、理想与排斥不重叠等交叉校验用"提交后的完整状态"判断；数组按固定顺序存
+      const imageTagCheck = validateProfileImageTagPatch(patch, locked)
+      if (imageTagCheck.problems.length > 0) throw new BadRequest(imageTagCheck.problems[0], imageTagCheck.problems)
+      Object.assign(patch, imageTagCheck.normalized)
 
-    const changes: { fieldName: string; oldValue: string; newValue: string }[] = []
-    const updateData: Record<string, unknown> = {}
-    for (const key of validKeys) {
-      const oldVal = (profile as Record<string, unknown>)[key]
-      let newVal = patch[key]
-      if (Array.isArray(newVal) || (typeof newVal === "object" && newVal !== null)) {
-        newVal = JSON.stringify(newVal)
-      }
-      const oldStr = stringifyFieldValue(oldVal)
-      const newStr = stringifyFieldValue(newVal)
-      if (oldStr === newStr) continue
-
-      updateData[key] = newVal
-      changes.push({ fieldName: toSnakeCase(key), oldValue: oldStr, newValue: newStr })
-    }
+      const diff = diffProfileFields(locked as Record<string, unknown>, patch, validKeys)
+      const row = await commitRevision(tx, {
+        locked, changes: diff.changes, mainTableUpdate: diff.updateData, source, reason, changedByUserId: changedByUid,
+      })
+      return { row, changes: diff.changes }
+    })
 
     if (changes.length === 0) {
-      return res.json({ message: "没有字段发生变化", profile })
+      return res.json({ message: "没有字段发生变化", profile: row })
     }
-
-    const newVersion = profile.profileVersion + 1
-    updateData.profileVersion = newVersion
-    updateData.lastUpdatedSource = source
-
-    await db.update(humanStyleProfiles).set(updateData).where(eq(humanStyleProfiles.id, profile.id))
-
-    const changedByUid = changedByUserId ?? req.user!.id
-    for (const change of changes) {
-      await db.insert(profileFieldChangeLog).values({
-        profileId: profile.profileId,
-        profileVersion: newVersion,
-        fieldName: change.fieldName,
-        oldValue: change.oldValue,
-        newValue: change.newValue,
-        reason: reason ?? null,
-        source,
-        changedByUserId: changedByUid,
-      })
-    }
-
-    const updated = await db.select().from(humanStyleProfiles).where(eq(humanStyleProfiles.id, profile.id)).limit(1)
-    res.json({ message: `已更新 ${changes.length} 个字段`, profile: updated[0], changedFields: changes.map(c => c.fieldName) })
+    res.json({ message: `已更新 ${changes.length} 个字段`, profile: row, changedFields: changes.map(c => c.fieldName) })
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors[0].message })
+    if (error instanceof BadRequest) return res.status(400).json({ error: error.message, details: error.details })
     console.error("Patch human profile error:", error)
     res.status(500).json({ error: "更新档案失败" })
   }
@@ -221,10 +198,11 @@ const styleScoresSchema = z.object({
     isSecondary: z.boolean().optional(),
   })),
   engineVersion: z.string().min(1).max(50).optional(),
+  source: changeSourceSchema.optional(),
 })
 router.post("/me/style-scores", authenticate, async (req: AuthRequest, res) => {
   try {
-    const { scores, engineVersion } = styleScoresSchema.parse(req.body)
+    const { scores, engineVersion, source } = styleScoresSchema.parse(req.body)
     const problems = validateStyleScores(scores)
     if (problems.length > 0) {
       return res.status(400).json({ error: "风格概率分布不合法", details: problems })
@@ -232,7 +210,10 @@ router.post("/me/style-scores", authenticate, async (req: AuthRequest, res) => {
     const profile = await getOrCreateProfile(req.user!.id)
     const calculatedAt = new Date()
 
+    // 2026-11-12：分布内容有变化时记一条 style_scores 变更日志、升版本、存快照（同一事务）
     await db.transaction(async (tx) => {
+      const locked = await lockProfile(tx, profile.id)
+      const before = canonicalStyleScores(await tx.select().from(profileStyleScores).where(eq(profileStyleScores.profileId, profile.profileId)))
       await tx.delete(profileStyleScores).where(eq(profileStyleScores.profileId, profile.profileId))
       await tx.insert(profileStyleScores).values(scores.map(s => ({
         profileId: profile.profileId,
@@ -243,6 +224,12 @@ router.post("/me/style-scores", authenticate, async (req: AuthRequest, res) => {
         engineVersion: engineVersion ?? null,
         calculatedAt,
       })))
+      const after = canonicalStyleScores(scores.map(s => ({ ...s, probability: roundProbability(s.probability), isPrimary: s.isPrimary ?? false, isSecondary: s.isSecondary ?? false })))
+      await commitRevision(tx, {
+        locked, source: (source ?? "face_test") as ChangeSource, changedByUserId: req.user!.id,
+        reason: engineVersion ? `13 型风格分布（引擎 ${engineVersion}）` : "13 型风格分布",
+        changes: before === after ? [] : [{ fieldName: "style_scores", oldValue: before, newValue: after }],
+      })
     })
     res.json({ message: "风格概率分布已更新", count: scores.length })
   } catch (error) {
@@ -261,23 +248,33 @@ const lifestyleScenariosSchema = z.object({
     isFocus: z.boolean().optional(),
     weight: z.number().min(0).max(1),
   })),
+  source: changeSourceSchema.optional(),
 })
 router.post("/me/lifestyle-scenarios", authenticate, async (req: AuthRequest, res) => {
   try {
-    const { scenarios } = lifestyleScenariosSchema.parse(req.body)
+    const { scenarios, source } = lifestyleScenariosSchema.parse(req.body)
     const profile = await getOrCreateProfile(req.user!.id)
 
-    await db.delete(profileLifestyleScenarios).where(eq(profileLifestyleScenarios.profileId, profile.profileId))
-    for (const s of scenarios) {
-      await db.insert(profileLifestyleScenarios).values({
+    // 2026-11-12：删旧写新放进同一事务（之前中途失败会留下半份场景），内容有变化时记日志、升版本、存快照
+    await db.transaction(async (tx) => {
+      const locked = await lockProfile(tx, profile.id)
+      const before = canonicalScenarios(await tx.select().from(profileLifestyleScenarios).where(eq(profileLifestyleScenarios.profileId, profile.profileId)))
+      await tx.delete(profileLifestyleScenarios).where(eq(profileLifestyleScenarios.profileId, profile.profileId))
+      const rows = scenarios.map(s => ({
         profileId: profile.profileId,
         scenarioParent: s.scenarioParent,
         scenarioType: s.scenarioType,
         scenarioName: s.scenarioName ?? null,
         isFocus: s.isFocus ?? false,
         weight: String(s.weight),
+      }))
+      if (rows.length > 0) await tx.insert(profileLifestyleScenarios).values(rows)
+      const after = canonicalScenarios(rows)
+      await commitRevision(tx, {
+        locked, source: (source ?? "user_manual_edit") as ChangeSource, changedByUserId: req.user!.id, reason: "生活场景权重",
+        changes: before === after ? [] : [{ fieldName: "lifestyle_scenarios", oldValue: before, newValue: after }],
       })
-    }
+    })
     res.json({ message: "生活场景权重已更新", count: scenarios.length })
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors[0].message })
@@ -290,21 +287,30 @@ router.post("/me/lifestyle-scenarios", authenticate, async (req: AuthRequest, re
 const itemPreferenceSchema = z.object({
   itemType: z.string().max(50),
   preferenceLevel: z.enum(["like", "neutral", "dislike"]),
+  source: changeSourceSchema.optional(),
 })
 router.post("/me/item-preferences", authenticate, async (req: AuthRequest, res) => {
   try {
-    const { itemType, preferenceLevel } = itemPreferenceSchema.parse(req.body)
+    const { itemType, preferenceLevel, source } = itemPreferenceSchema.parse(req.body)
     const profile = await getOrCreateProfile(req.user!.id)
 
-    const existing = await db.select().from(profileItemPreferences)
-      .where(and(eq(profileItemPreferences.profileId, profile.profileId), eq(profileItemPreferences.itemType, itemType)))
-      .limit(1)
-
-    if (existing.length > 0) {
-      await db.update(profileItemPreferences).set({ preferenceLevel }).where(eq(profileItemPreferences.id, existing[0].id))
-    } else {
-      await db.insert(profileItemPreferences).values({ profileId: profile.profileId, itemType, preferenceLevel })
-    }
+    // 2026-11-12：同一事务里 upsert + 记日志（item_preference.<标签>）、升版本、存快照；等级没变则不升版本
+    await db.transaction(async (tx) => {
+      const locked = await lockProfile(tx, profile.id)
+      const existing = await tx.select().from(profileItemPreferences)
+        .where(and(eq(profileItemPreferences.profileId, profile.profileId), eq(profileItemPreferences.itemType, itemType)))
+        .limit(1)
+      const before = existing[0]?.preferenceLevel ?? ""
+      if (existing.length > 0) {
+        await tx.update(profileItemPreferences).set({ preferenceLevel }).where(eq(profileItemPreferences.id, existing[0].id))
+      } else {
+        await tx.insert(profileItemPreferences).values({ profileId: profile.profileId, itemType, preferenceLevel })
+      }
+      await commitRevision(tx, {
+        locked, source: (source ?? "fashion_preference_test") as ChangeSource, changedByUserId: req.user!.id, reason: "单品偏好",
+        changes: before === preferenceLevel ? [] : [{ fieldName: `item_preference.${itemType}`, oldValue: before, newValue: preferenceLevel }],
+      })
+    })
     res.json({ message: "单品偏好已保存" })
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors[0].message })
@@ -317,21 +323,30 @@ router.post("/me/item-preferences", authenticate, async (req: AuthRequest, res) 
 const visualStylePreferenceSchema = z.object({
   visualStyleTag: z.string().max(50),
   preferenceLevel: z.enum(["like", "neutral", "dislike"]),
+  source: changeSourceSchema.optional(),
 })
 router.post("/me/visual-style-preferences", authenticate, async (req: AuthRequest, res) => {
   try {
-    const { visualStyleTag, preferenceLevel } = visualStylePreferenceSchema.parse(req.body)
+    const { visualStyleTag, preferenceLevel, source } = visualStylePreferenceSchema.parse(req.body)
     const profile = await getOrCreateProfile(req.user!.id)
 
-    const existing = await db.select().from(profileVisualStylePreferences)
-      .where(and(eq(profileVisualStylePreferences.profileId, profile.profileId), eq(profileVisualStylePreferences.visualStyleTag, visualStyleTag)))
-      .limit(1)
-
-    if (existing.length > 0) {
-      await db.update(profileVisualStylePreferences).set({ preferenceLevel }).where(eq(profileVisualStylePreferences.id, existing[0].id))
-    } else {
-      await db.insert(profileVisualStylePreferences).values({ profileId: profile.profileId, visualStyleTag, preferenceLevel })
-    }
+    // 2026-11-12：同一事务里 upsert + 记日志（visual_style_preference.<标签>）、升版本、存快照；等级没变则不升版本
+    await db.transaction(async (tx) => {
+      const locked = await lockProfile(tx, profile.id)
+      const existing = await tx.select().from(profileVisualStylePreferences)
+        .where(and(eq(profileVisualStylePreferences.profileId, profile.profileId), eq(profileVisualStylePreferences.visualStyleTag, visualStyleTag)))
+        .limit(1)
+      const before = existing[0]?.preferenceLevel ?? ""
+      if (existing.length > 0) {
+        await tx.update(profileVisualStylePreferences).set({ preferenceLevel }).where(eq(profileVisualStylePreferences.id, existing[0].id))
+      } else {
+        await tx.insert(profileVisualStylePreferences).values({ profileId: profile.profileId, visualStyleTag, preferenceLevel })
+      }
+      await commitRevision(tx, {
+        locked, source: (source ?? "fashion_preference_test") as ChangeSource, changedByUserId: req.user!.id, reason: "视觉风格偏好",
+        changes: before === preferenceLevel ? [] : [{ fieldName: `visual_style_preference.${visualStyleTag}`, oldValue: before, newValue: preferenceLevel }],
+      })
+    })
     res.json({ message: "视觉风格偏好已保存" })
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ error: error.errors[0].message })
@@ -359,35 +374,27 @@ router.post("/me/color-signals", authenticate, async (req: AuthRequest, res) => 
     const { signalType, value, sourceMethod, confidence } = colorSignalSchema.parse(req.body)
     const profile = await getOrCreateProfile(req.user!.id)
 
-    await db.update(profileColorSignals)
-      .set({ isPrimary: false })
-      .where(and(eq(profileColorSignals.profileId, profile.profileId), eq(profileColorSignals.signalType, signalType)))
-
-    await db.insert(profileColorSignals).values({
-      profileId: profile.profileId,
-      signalType, value, sourceMethod,
-      confidence: confidence !== undefined ? String(confidence) : null,
-      isPrimary: true,
-    })
-
-    const cacheField = COLOR_SIGNAL_FIELD_MAP[signalType]
-    const oldVal = stringifyFieldValue((profile as Record<string, unknown>)[cacheField])
-    if (oldVal !== value) {
-      const newVersion = profile.profileVersion + 1
-      await db.update(humanStyleProfiles)
-        .set({ [cacheField]: value, profileVersion: newVersion, lastUpdatedSource: SOURCE_METHOD_TO_CHANGE_SOURCE[sourceMethod] as any })
-        .where(eq(humanStyleProfiles.id, profile.id))
-      await db.insert(profileFieldChangeLog).values({
+    // 2026-11-12：观测记录、档案缓存字段、变更日志、版本号、快照放进同一事务
+    await db.transaction(async (tx) => {
+      const locked = await lockProfile(tx, profile.id)
+      await tx.update(profileColorSignals)
+        .set({ isPrimary: false })
+        .where(and(eq(profileColorSignals.profileId, profile.profileId), eq(profileColorSignals.signalType, signalType)))
+      await tx.insert(profileColorSignals).values({
         profileId: profile.profileId,
-        profileVersion: newVersion,
-        fieldName: signalType,
-        oldValue: oldVal,
-        newValue: value,
-        reason: `色彩信号观测（来源：${sourceMethod}）`,
-        source: SOURCE_METHOD_TO_CHANGE_SOURCE[sourceMethod] as any,
-        changedByUserId: req.user!.id,
+        signalType, value, sourceMethod,
+        confidence: confidence !== undefined ? String(confidence) : null,
+        isPrimary: true,
       })
-    }
+      const cacheField = COLOR_SIGNAL_FIELD_MAP[signalType]
+      const oldVal = stringifyFieldValue((locked as Record<string, unknown>)[cacheField])
+      await commitRevision(tx, {
+        locked, source: SOURCE_METHOD_TO_CHANGE_SOURCE[sourceMethod] as ChangeSource, changedByUserId: req.user!.id,
+        reason: `色彩信号观测（来源：${sourceMethod}）`,
+        mainTableUpdate: { [cacheField]: value },
+        changes: oldVal === value ? [] : [{ fieldName: signalType, oldValue: oldVal, newValue: value }],
+      })
+    })
 
     res.json({ message: "色彩信号已记录" })
   } catch (error) {

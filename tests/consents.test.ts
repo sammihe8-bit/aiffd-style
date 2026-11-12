@@ -56,6 +56,15 @@ test("同意时间：onboarding 用服务器时间，忽略客户端上报；补
   assert.equal(resolveConsentedAt(backNoTime, now), null);
 });
 
+test("profile_update（2026-11-12）：可撤回两项可选授权，必选两项仍须为 true，时间用服务器时间", () => {
+  const now = new Date("2026-11-12T12:00:00Z");
+  const withdraw = ok({ ...base, photoConsent: false, researchDataConsent: false, source: "profile_update", consentedAt: "2026-10-01T00:00:00Z" });
+  assert.equal(withdraw.source, "profile_update");
+  assert.equal(resolveConsentedAt(withdraw, now)?.toISOString(), now.toISOString());
+  bad({ ...base, privacyAck: false, source: "profile_update" }, "隐私政策");
+  bad({ ...base, source: "withdraw" }, "source");
+});
+
 for (const [name, fn] of tests) {
   try { fn(); passed++; console.log(`  ✓ ${name}`); }
   catch (e) { console.log(`  ✗ ${name}\n    ${(e as Error).message}`); }

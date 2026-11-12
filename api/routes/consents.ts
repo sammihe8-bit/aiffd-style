@@ -36,6 +36,12 @@ router.post("/", authenticate, async (req: AuthRequest, res) => {
         .where(eq(userConsents.userId, req.user!.id)).limit(1);
       if (existing.length > 0) return res.status(409).json({ error: "服务端已有同意记录，不再接受补传", code: "CONSENT_EXISTS" });
     }
+    if (input.source === "profile_update") {
+      // 修改可选授权的前提是用户已经同意过（有 onboarding 或补传记录）；没有时应先走 Onboarding
+      const existing = await db.select({ id: userConsents.id }).from(userConsents)
+        .where(eq(userConsents.userId, req.user!.id)).limit(1);
+      if (existing.length === 0) return res.status(409).json({ error: "还没有同意记录，请先完成数据使用同意", code: "CONSENT_MISSING" });
+    }
     await db.insert(userConsents).values({
       userId: req.user!.id,
       ageAndResearchAck: input.ageAndResearchAck,
